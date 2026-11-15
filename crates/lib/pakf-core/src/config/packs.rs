@@ -144,15 +144,18 @@ fn parse_packs(root: &RepoRoot) -> Result<PacksFile> {
 
 /// `add_entry` returns the text of the configuration `text`, or of an
 /// absent file when it is `None`, with `entry` appended as the last
-/// `[[pack]]` entry. Every other line, comment, and blank line stays, and the
-/// text keeps the line ending of the file.
+/// `[[pack]]` entry. Every other line, comment, and blank line stays, an
+/// entry that no table follows goes after the comments at the end of the
+/// file, and the text keeps the line ending of the file.
 // sokf-implements: CLI-3_AC-3
+// sokf-implements: CLI-3_AC-5
 pub fn add_entry(text: Option<&str>, entry: &PackEntry) -> Result<String> {
     let eol = eol_of(text.unwrap_or_default());
-    added(text, entry).map(|out| with_eol(&out, eol))
+    let lf = text.map(|t| t.replace("\r\n", "\n"));
+    added(lf.as_deref(), entry).map(|out| with_eol(&out, eol))
 }
 
-/// `added` is `add_entry` with LF line endings for the entry.
+/// `added` is `add_entry` on a text with LF line endings.
 fn added(text: Option<&str>, entry: &PackEntry) -> Result<String> {
     let mut doc = parse(text)?;
     let mut table = Table::new();
@@ -170,52 +173,99 @@ fn added(text: Option<&str>, entry: &PackEntry) -> Result<String> {
         }
         table.insert("paths", value(paths));
     }
-    match doc.get_mut("pack") {
-        None => {
-            // A file that holds no table keeps its comments as the trailing
-            // text of the document, which would follow the new entry, so
-            // the entry goes after the file's text instead.
-            let empty = doc.as_table().is_empty();
-            let mut packs = ArrayOfTables::new();
-            packs.push(table);
-            if empty {
-                let mut alone = DocumentMut::new();
-                alone.insert("pack", Item::ArrayOfTables(packs));
-                let before = text.unwrap_or_default();
-                if before.trim().is_empty() {
-                    return Ok(alone.to_string());
-                }
-                // A blank line comes between the file's text and the entry.
-                let gap = if before.ends_with("\n\n") || before.ends_with("\n\r\n") {
-                    ""
-                } else if before.ends_with('\n') {
-                    "\n"
-                } else {
-                    "\n\n"
-                };
-                return Ok(format!("{before}{gap}{alone}"));
-            }
-            doc.insert("pack", Item::ArrayOfTables(packs));
+    // A file of blank lines gives way to the entry.
+    if text.unwrap_or_default().trim().is_empty() {
+        doc = DocumentMut::new();
+    }
+    // The comments at the end of the file are the trailing text of the
+    // document, which follows every table, so a new entry that no table
+    // follows takes them before it, and goes after the file's whole text.
+    let trailing = trailing(&doc);
+    let last = match doc.get("pack") {
+        None => true,
+        Some(Item::ArrayOfTables(packs)) => {
+            packs.iter().map(last_of).max().flatten() >= last_position(doc.as_table())
         }
-        Some(Item::ArrayOfTables(packs)) => packs.push(table),
         Some(_) => return Err(not_a_list()),
+    };
+    if last && !trailing.trim().is_empty() {
+        // A blank line comes between the file's text and the entry, after
+        // the final line ending that the text lacks, and the removal of the
+        // entry takes it back.
+        let gap = if trailing.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        table.decor_mut().set_prefix(format!("{trailing}{gap}"));
+        table.set_position(Some(last_position(doc.as_table()).map_or(0, |p| p + 1)));
+        doc.set_trailing("");
+    }
+    if let Some(Item::ArrayOfTables(packs)) = doc.get_mut("pack") {
+        packs.push(table);
+    } else {
+        let mut packs = ArrayOfTables::new();
+        packs.push(table);
+        doc.insert("pack", Item::ArrayOfTables(packs));
     }
     Ok(doc.to_string())
 }
 
-/// `remove_entry` returns the text of the configuration `text` without the
-/// `[[pack]]` entry of the pack `name`, or `None` when no entry declares
-/// it. Every other line, comment, and blank line stays, and the text keeps
-/// the line ending of the file.
-// sokf-implements: CLI-3_AC-3
-pub fn remove_entry(text: &str, name: &str) -> Result<Option<String>> {
-    let eol = eol_of(text);
-    removed(text, name).map(|out| out.map(|o| with_eol(&o, eol)))
+/// `last_position` returns the greatest position in the document of the
+/// tables below `table`, or none when no table below it has a position.
+fn last_position(table: &Table) -> Option<isize> {
+    table
+        .iter()
+        .filter_map(|(_, item)| match item {
+            Item::Table(t) => last_of(t),
+            Item::ArrayOfTables(a) => a.iter().map(last_of).max().flatten(),
+            _ => None,
+        })
+        .max()
 }
 
-/// `removed` is `remove_entry` before the line ending of the file.
+/// `last_of` returns the greatest position of the table `table` and of the
+/// tables below it.
+fn last_of(table: &Table) -> Option<isize> {
+    table.position().max(last_position(table))
+}
+
+/// `trailing` returns the text of the document `doc` after its last table.
+fn trailing(doc: &DocumentMut) -> String {
+    doc.trailing().as_str().unwrap_or_default().to_string()
+}
+
+/// `up_to_last_blank_line` returns the part of the decor `prefix` before a
+/// table up to and with its last blank line, which leaves out the comment
+/// lines right above the table.
+fn up_to_last_blank_line(prefix: &str) -> &str {
+    let mut end = 0;
+    let mut at = 0;
+    for line in prefix.split_inclusive('\n') {
+        at += line.len();
+        if line.ends_with('\n') && line.trim().is_empty() {
+            end = at;
+        }
+    }
+    &prefix[..end]
+}
+
+/// `remove_entry` returns the text of the configuration `text` without the
+/// `[[pack]]` entry of the pack `name`, or `None` when no entry declares
+/// it. Every other line, comment, and blank line stays, the text that
+/// `add_entry` appended to comes back, and the text keeps the line ending of
+/// the file.
+// sokf-implements: CLI-3_AC-3
+// sokf-implements: CONF-4_AC-2
+pub fn remove_entry(text: &str, name: &str) -> Result<Option<String>> {
+    let eol = eol_of(text);
+    removed(&text.replace("\r\n", "\n"), name).map(|out| out.map(|o| with_eol(&o, eol)))
+}
+
+/// `removed` is `remove_entry` on a text with LF line endings.
 fn removed(text: &str, name: &str) -> Result<Option<String>> {
     let mut doc = parse(Some(text))?;
+    let trailing = trailing(&doc);
     let Some(item) = doc.get_mut("pack") else {
         return Ok(None);
     };
@@ -228,14 +278,13 @@ fn removed(text: &str, name: &str) -> Result<Option<String>> {
     else {
         return Ok(None);
     };
-    // The comments before the last entry of a file that holds no other
-    // table stay, as the file's own text.
-    let prefix = packs
+    let (prefix, position) = packs
         .get(i)
-        .and_then(|t| t.decor().prefix())
-        .and_then(|p| p.as_str())
-        .unwrap_or_default()
-        .to_string();
+        .map(|t| {
+            let prefix = t.decor().prefix().and_then(|p| p.as_str());
+            (prefix.unwrap_or_default().to_string(), t.position())
+        })
+        .unwrap_or_default();
     packs.remove(i);
     // The comments before the first entry, such as the file's header, stay
     // before the entry that comes first now.
@@ -253,8 +302,26 @@ fn removed(text: &str, name: &str) -> Result<Option<String>> {
     }
     if packs.is_empty() {
         doc.remove("pack");
-        if doc.as_table().is_empty() && !prefix.trim().is_empty() {
-            return Ok(Some(format!("{prefix}{doc}")));
+    }
+    // The lines before the last table of the file up to its last blank line,
+    // or all of them in a file that holds no other key or table, stay before
+    // the file's trailing text, such as the comments that `pakf add` put
+    // before its entry, without the blank line that `pakf add` put after
+    // them. The comment lines right above the table describe it, and go
+    // with it.
+    if position.is_some() && last_position(doc.as_table()) < position {
+        let kept = if doc.as_table().is_empty() {
+            &prefix
+        } else {
+            up_to_last_blank_line(&prefix)
+        };
+        if !kept.trim().is_empty() {
+            let kept = if kept.ends_with("\n\n") {
+                &kept[..kept.len() - 1]
+            } else {
+                kept
+            };
+            doc.set_trailing(format!("{kept}{trailing}"));
         }
     }
     Ok(Some(doc.to_string()))
@@ -269,13 +336,10 @@ fn eol_of(text: &str) -> &'static str {
     }
 }
 
-/// `with_eol` returns `text` with each line ending as `eol`.
+/// `with_eol` returns the text `text`, which has LF line endings, with each
+/// line ending as `eol`.
 fn with_eol(text: &str, eol: &str) -> String {
-    if eol == "\n" {
-        text.to_string()
-    } else {
-        text.replace("\r\n", "\n").replace('\n', eol)
-    }
+    text.replace('\n', eol)
 }
 
 fn parse(text: Option<&str>) -> Result<DocumentMut> {
@@ -369,6 +433,93 @@ mod tests {
             );
             let back = remove_entry(&crlf, "@acme/base").unwrap().unwrap();
             assert!(!back.replace("\r\n", "").contains('\n'), "{back:?}");
+        }
+    }
+
+    // sokf-tests: CLI-3_AC-5
+    // sokf-tests: CLI-3_AC-3
+    #[test]
+    fn a_new_entry_follows_the_comment_at_the_end_of_the_file() {
+        let new = "[[pack]]\nname = \"@acme/base\"\nsource = \"git@example.com:acme/base.git\"\npath = \"packs/base\"\n";
+        let first = "[[pack]]\nname = \"@a/a\"\nsource = \"x\"\n";
+        for text in [
+            "version = 1\n# Add packs below.\n",
+            "version = 1\n# Add packs below.",
+            "version = 1\r\n# Add packs below.\r\n",
+            &format!("{first}# Add packs below.\n"),
+        ] {
+            let added = add_entry(Some(text), &entry("@acme/base")).unwrap();
+            let eol = if text.contains('\r') { "\r\n" } else { "\n" };
+            assert!(added.starts_with(text), "{added:?}");
+            assert!(added.ends_with(&new.replace('\n', eol)), "{added:?}");
+            // The removal of the entry keeps the comment.
+            let removed = remove_entry(&added, "@acme/base").unwrap().unwrap();
+            assert_eq!(removed.trim_end(), text.trim_end());
+        }
+        // The comment lines right above the last entry describe it, and go
+        // with it, and the lines before them stay.
+        let described = format!("{first}\n# The base, pinned.\n{new}# The end.\n");
+        let removed = remove_entry(&described, "@acme/base").unwrap().unwrap();
+        assert_eq!(removed, format!("{first}# The end.\n"));
+        let described = format!("{first}# Kept.\n\n# The base, pinned.\n{new}");
+        let removed = remove_entry(&described, "@acme/base").unwrap().unwrap();
+        assert_eq!(removed, format!("{first}# Kept.\n"));
+        // An entry that a table follows goes after the last entry, and the
+        // comment at the end of the file stays after that table.
+        let text = format!("{first}\n[harness.claude]\nwith = []\n# The end.\n");
+        let added = add_entry(Some(&text), &entry("@acme/base")).unwrap();
+        assert!(
+            added.starts_with(&format!("{first}\n{new}\n[harness.claude]")),
+            "{added:?}"
+        );
+        assert!(added.ends_with("with = []\n# The end.\n"), "{added:?}");
+    }
+
+    // sokf-tests: CONF-4_AC-2
+    #[test]
+    fn a_removal_gives_back_the_file_before_the_addition() {
+        let first = "[[pack]]\nname = \"@a/a\"\nsource = \"x\"\n";
+        for text in [
+            "",
+            "# c\n",
+            "# c\n\n",
+            "# The packs.   \n\n\n",
+            "# c\r\n",
+            "# c\r\n\r\n",
+            "version = 1\n",
+            "version = 1\n\n",
+            "version = 1\n# Add packs below.\n",
+            "version = 1\n\n# Add packs below.\n\n",
+            "version = 1\r\n# Add packs below.\r\n",
+            first,
+            &format!("{first}# Add packs below.\n"),
+            &format!("{first}\n# Add packs below.\n\n"),
+            &format!("{first}\n[harness.claude]\nwith = []\n# The end.\n"),
+        ] {
+            let added = add_entry(Some(text), &entry("@acme/base")).unwrap();
+            let removed = remove_entry(&added, "@acme/base").unwrap().unwrap();
+            assert_eq!(removed, text, "{added:?}");
+        }
+        // A text without its final line ending comes back with it.
+        for text in ["# c", "version = 1\n# c"] {
+            let added = add_entry(Some(text), &entry("@acme/base")).unwrap();
+            let removed = remove_entry(&added, "@acme/base").unwrap().unwrap();
+            assert_eq!(removed, format!("{text}\n"), "{added:?}");
+        }
+        // The removal of an entry that a person wrote keeps each line ending
+        // of the comments before it.
+        let new = "[[pack]]\nname = \"@a/n\"\nsource = \"y\"\n";
+        for (text, kept) in [
+            (format!("# Packs\n{new}"), "# Packs\n"),
+            (format!("# Packs\n{new}# end\n"), "# Packs\n# end\n"),
+            (format!("# Packs\n\n{new}"), "# Packs\n"),
+            (format!("version = 1\n\n\n{new}"), "version = 1\n"),
+            (
+                format!("version = 1\n# c\n\n# n\n{new}# end\n"),
+                "version = 1\n# c\n# end\n",
+            ),
+        ] {
+            assert_eq!(remove_entry(&text, "@a/n").unwrap().unwrap(), kept);
         }
     }
 }
