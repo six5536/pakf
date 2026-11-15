@@ -1,0 +1,34 @@
+{
+  "name": "@six5536/pakf-darwin-arm64",
+  "version": "0.1.0",
+  "description": "This package contains the prebuilt pakf binary for darwin-arm64.",
+  "keywords": [
+    "cli",
+    "command-line"
+  ],
+  "homepage": "https://github.com/six5536/pakf#readme",
+  "bugs": {
+    "url": "https://github.com/six5536/pakf/issues"
+  },
+  "license": "Elastic-2.0",
+  "author": "six5536 <10079653+six5536@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/six5536/pakf.git",
+    "directory": "packages/pakf-darwin-arm64"
+  },
+  "files": [
+    "bin/"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org"
+  }
+}

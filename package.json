@@ -1,0 +1,8 @@
+{
+  "name": "@six5536/pakf-workspace",
+  "private": true,
+  "description": "pakf: the npm workspace of the launcher of the pakf command.",
+  "workspaces": [
+    "packages/cli"
+  ]
+}

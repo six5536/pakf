@@ -1,0 +1,32 @@
+[package]
+name = "pakf-core"
+description = "The library of pakf, which shares project files through packs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Elastic-2.0"
+repository = "https://github.com/six5536/pakf"
+readme = "README.md"
+keywords = ["packs", "project-files", "templates", "merge"]
+categories = ["development-tools"]
+include = ["/src", "/README.md", "/LICENSE"]
+
+[dependencies]
+agent-harness-adapter-core = "0.4.0"
+dunce = "1.0"
+ignore = "0.4"
+jmespath = "0.5"
+saphyr = "0.1"
+saphyr-parser = "0.1"
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "2.0"
+toml = "1.1"
+toml_edit = "0.25"
+
+[dev-dependencies]
+proptest = "1.11"
+
+[lints]
+workspace = true

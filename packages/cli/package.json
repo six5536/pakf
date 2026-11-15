@@ -1,0 +1,48 @@
+{
+  "name": "@six5536/pakf",
+  "version": "0.1.0",
+  "description": "pakf shares project files through packs. It copies the files of each pack into a project, records the base of each file in a lock, and merges each later change of a pack into the project's own edits.",
+  "keywords": [
+    "cli",
+    "command-line",
+    "project-files",
+    "rust",
+    "templates"
+  ],
+  "homepage": "https://github.com/six5536/pakf#readme",
+  "bugs": {
+    "url": "https://github.com/six5536/pakf/issues"
+  },
+  "license": "Elastic-2.0",
+  "author": "six5536 <10079653+six5536@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/six5536/pakf.git",
+    "directory": "packages/cli"
+  },
+  "bin": {
+    "pakf": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "lib/"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "optionalDependencies": {
+    "@six5536/pakf-darwin-arm64": "0.1.0",
+    "@six5536/pakf-darwin-x64": "0.1.0",
+    "@six5536/pakf-linux-arm64": "0.1.0",
+    "@six5536/pakf-linux-x64": "0.1.0",
+    "@six5536/pakf-win32-x64": "0.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

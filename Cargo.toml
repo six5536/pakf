@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = ["crates/*/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+
+[workspace.dependencies]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+# cargo-llvm-cov sets the `coverage_nightly` cfg in the task coverage:report:rust,
+# which runs on nightly. Declare it as expected, so that no toolchain warns that
+# it is unknown.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+struct_excessive_bools = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+
+# Optimise release builds for size
+[profile.release]
+opt-level = "z" # optimise for size rather than speed
+strip = true # strip the debug information and symbols
+lto = true # optimise at link time across all the crates
+panic = "abort" # abort on a panic, without the cost of unwinding
+codegen-units = 1 # build one code generation unit, so the compiler can optimise across the whole crate
+
+[profile.test]
+opt-level = 0
+debug = 0
+split-debuginfo = "unpacked" # on macOS, the linker skips dsymutil, which makes linking faster
+
+# Optimise the dependencies of the tests, but not the workspace crates.
+# The tests and property tests call the dependencies, such as the parsers and
+# the regular expression engine, hundreds of times, so the dependencies build at
+# opt-level 2 instead of 0. Cargo builds them only once, and after a change to a
+# workspace crate it rebuilds only that crate, which stays quick because it is
+# not optimised.
+[profile.test.package."*"]
+opt-level = 2
