@@ -1,6 +1,6 @@
 {
   "name": "@six5536/pakf-linux-arm64",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "This package contains the prebuilt pakf binary for linux-arm64.",
   "keywords": [
     "cli",

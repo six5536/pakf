@@ -19,22 +19,30 @@ use crate::{Error, RepoPath, RepoRoot, Result, config::PathArg, pack};
 
 mod text;
 
-/// A `PackFileKind` is what a file of a pack is, from its place in the pack.
+/// A `PackFileKind` is what a file of a pack is, from its place in the pack
+/// and the declaration of the pack that owns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PackFileKind {
     /// A file of the pack's `files/`, at its path from the repository root
     /// after the remaps of the pack's entry.
     File,
+    /// A file of the pack's `files/` that the pack that owns it declares
+    /// editable, whose edit needs no acceptance.
+    Editable,
     /// The copy of the pack's `instructions.md`.
     Instructions,
 }
 
 impl PackFileKind {
-    /// `of` returns the kind of the file whose path in the pack is `rel`.
-    fn of(rel: &str) -> PackFileKind {
+    /// `of` returns the kind of the file whose path in the pack is `rel` and
+    /// whose record is `f`.
+    // sokf-implements: CLI-5_AC-37
+    pub(super) fn of(rel: &str, f: &pack::LockedFile) -> PackFileKind {
         if rel == "instructions.md" {
             PackFileKind::Instructions
+        } else if f.editable {
+            PackFileKind::Editable
         } else {
             PackFileKind::File
         }
@@ -44,6 +52,7 @@ impl PackFileKind {
     pub fn label(self) -> &'static str {
         match self {
             PackFileKind::File => "file",
+            PackFileKind::Editable => pack::EDITABLE,
             PackFileKind::Instructions => "instructions",
         }
     }
@@ -188,8 +197,9 @@ pub struct PackLsEntry {
     /// The id of the pack that owns the file, and `null` for a directory and
     /// for a file that no pack delivered.
     pub pack: Option<String>,
-    /// The kind of the file of a pack, from its place in the pack, and `null`
-    /// for a directory and for a file that no pack delivered.
+    /// The kind of the file of a pack, from its place in the pack and the
+    /// declaration of the pack that owns it, and `null` for a directory and
+    /// for a file that no pack delivered.
     pub kind: Option<PackFileKind>,
     /// The state of the file of a pack, whatever its acceptance, or the
     /// state of the directory, from the files of packs below it, and `null`
@@ -342,7 +352,7 @@ fn records(root: &RepoRoot, lock: &pack::Lock) -> BTreeMap<String, Record> {
             continue;
         };
         for (rel, f) in &p.files {
-            let kind = PackFileKind::of(rel);
+            let kind = PackFileKind::of(rel, f);
             // `file_state` gives no state to a shadowed record, whose file
             // the record of its owner describes.
             let Some((state, acceptance)) = file_state(root, rel, f) else {
@@ -598,10 +608,16 @@ impl Lister<'_> {
 // sokf-implements: CLI-5_AC-13
 // sokf-implements: CLI-5_AC-30
 // sokf-implements: CLI-5_AC-31
+// sokf-implements: CLI-5_AC-38
 fn directory_state(records: &[&Record]) -> (Option<PackLsState>, Option<PackAcceptance>) {
     let worst =
         |keep: &dyn Fn(&Record) -> bool| records.iter().filter(|r| keep(r)).map(|r| r.state).max();
-    let accepted = |r: &Record| r.acceptance == Some(PackAcceptance::Accepted);
+    // An editable file that is edited counts as an accepted file, because
+    // neither fails the check.
+    let accepted = |r: &Record| {
+        r.acceptance == Some(PackAcceptance::Accepted)
+            || (r.kind == PackFileKind::Editable && r.state == PackLsState::Edited)
+    };
     if let Some(state) = worst(&|r| r.state.differs() && !accepted(r)) {
         return (Some(state), None);
     }

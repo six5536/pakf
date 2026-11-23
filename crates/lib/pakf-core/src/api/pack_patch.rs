@@ -72,13 +72,20 @@ pub fn pack_patch(root: &RepoRoot, options: &PackPatchOptions) -> Result<PackPat
     } else {
         Some(selection(root, &lock, &entry, options)?)
     };
+    // An editable file's edit is the project's own, so a patch without a
+    // path leaves it out.
+    // sokf-implements: CLI-9_AC-36
+    let editable = editable_dests(root, &entry);
     let e = edits(
         root,
         name,
         &entry,
         options.accepted,
         Purpose::Patch,
-        &|dest| chosen.as_ref().is_none_or(|c| c.edits.contains(dest)),
+        &|dest| match &chosen {
+            Some(c) => c.edits.contains(dest),
+            None => !editable.contains(dest),
+        },
     )?;
     let mut out = PackPatch {
         patch: e.patch,
@@ -107,6 +114,20 @@ pub fn pack_patch(root: &RepoRoot, options: &PackPatchOptions) -> Result<PackPat
         out.applied = rels.iter().map(|rel| format!("{label}/{rel}")).collect();
     }
     Ok(out)
+}
+
+/// `editable_dests` returns the destination of each editable file that the
+/// pack of the record `entry` owns and at which an entry stands, so that
+/// the patch still carries the deletion of an editable file, which needs an
+/// acceptance as any deletion does.
+fn editable_dests(root: &RepoRoot, entry: &pack::LockedPack) -> BTreeSet<String> {
+    entry
+        .files
+        .values()
+        .filter(|f| f.editable && f.shadowed_by.is_none())
+        .filter(|f| RepoPath::parse(&f.path).is_some_and(|p| !pack::is_absent(&p.to_fs(root))))
+        .map(|f| f.path.clone())
+        .collect()
 }
 
 /// `apply_target` returns the pack's directory in the working tree of the
@@ -179,6 +200,9 @@ struct Selector<'a> {
     entry: &'a pack::LockedPack,
     /// The destination of each file that the pack owns.
     owned: BTreeSet<RepoPath>,
+    /// The destination of each editable file that the pack owns, which the
+    /// patch takes only where a path names it.
+    editable: BTreeSet<String>,
     /// The pack's directory in the source of each pack that the lock
     /// records or the configuration declares whose source is a local
     /// directory of the repository, by the pack's name.
@@ -278,6 +302,7 @@ fn selection(
         options,
         entry,
         owned,
+        editable: editable_dests(root, entry),
         sources,
         owners,
         remap,
@@ -313,6 +338,8 @@ impl Selector<'_> {
         if !self.seen.insert(dest.clone()) {
             return Ok(());
         }
+        // A path that names an editable file takes its edit.
+        // sokf-implements: CLI-9_AC-37
         if self.owned.contains(dest) {
             self.owned_file(dest, true);
             return Ok(());
@@ -393,7 +420,13 @@ impl Selector<'_> {
             .cloned()
             .collect();
         let holds = !owned.is_empty();
+        // An editable file below the directory goes into the patch only
+        // where a path names it, before or after the directory.
+        // sokf-implements: CLI-9_AC-36
         for dest in owned {
+            if self.editable.contains(dest.as_str()) {
+                continue;
+            }
             if self.seen.insert(dest.clone()) {
                 self.owned_file(&dest, false);
             }

@@ -170,9 +170,9 @@ pub struct PackAddArgs {
 /// `PackStatusArgs` holds the arguments of `pakf status`.
 #[derive(Debug, Args)]
 pub struct PackStatusArgs {
-    /// Exit with code 1 when a file of a pack is edited, conflicted, or
-    /// deleted and its acceptance isn't `accepted`, so that a check fails on
-    /// an edit that nobody has reviewed.
+    /// Exit with code 1 when a file of a pack is conflicted or deleted, or
+    /// edited and not editable, and its acceptance isn't `accepted`, so that
+    /// a check fails on an edit that nobody has reviewed.
     #[arg(long)]
     pub check: bool,
 
@@ -238,7 +238,8 @@ pub struct PackLsArgs {
     /// List only the files with the acceptance ACCEPTANCE, and the
     /// directories that hold one, or, for `unaccepted`, the files whose
     /// acceptance is `stale` or absent, so that with `--state edited` it
-    /// lists the edits that `pakf status --check` fails on.
+    /// lists the edits that nobody has accepted, the edits of editable files
+    /// among them, which `pakf status --check` passes.
     #[arg(long, value_enum, value_name = "ACCEPTANCE")]
     pub acceptance: Option<AcceptanceArg>,
 
@@ -357,7 +358,8 @@ pub struct PackPatchArgs {
     /// The files of the pack whose edits to take, and the files that the
     /// pack doesn't hold yet to add to it at their places in the pack, as
     /// filesystem paths or paths from the repository root. Default: every
-    /// edit of the pack.
+    /// edit of the pack, apart from the edit of an editable file, which a
+    /// PATH has to name.
     #[arg(value_name = "PATH")]
     pub paths: Vec<String>,
 

@@ -471,6 +471,13 @@ fn from_lock(root: &RepoRoot, name: &str, locked: &LockedPack) -> Result<Fetched
                 requires_pakf: "0.0.0".into(),
                 description: String::new(),
                 depends: locked.depends.clone(),
+                // A shadowed record carries its pack's declaration too.
+                editable: locked
+                    .files
+                    .iter()
+                    .filter(|(_, f)| f.editable)
+                    .filter_map(|(rel, _)| rel.strip_prefix("files").map(str::to_string))
+                    .collect(),
             },
             files,
             executable: locked

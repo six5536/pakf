@@ -3,11 +3,12 @@ resolver = "3"
 members = ["crates/*/*"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99.1"
 
 [workspace.dependencies]
+pakf-core = { path = "crates/lib/pakf-core", version = "0.2.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -1,7 +1,7 @@
 //! This module reads `pakf.yaml`, the manifest of a pack, and
 //! compares the versions that the manifest gives.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     Error, Result,
@@ -11,8 +11,20 @@ use crate::{
 /// `MANIFEST` is the file name of a pack's manifest.
 pub const MANIFEST: &str = "pakf.yaml";
 
-/// `KEYS` lists the keys of a manifest. Each is required except `depends`.
-const KEYS: &[&str] = &["name", "version", "requires-pakf", "description", "depends"];
+/// `EDITABLE` is the key of a manifest that lists the pack's editable
+/// files, and the word of their kind in the reports.
+pub const EDITABLE: &str = "editable";
+
+/// `KEYS` lists the keys of a manifest. Each is required except `depends`
+/// and `editable`.
+const KEYS: &[&str] = &[
+    "name",
+    "version",
+    "requires-pakf",
+    "description",
+    "depends",
+    EDITABLE,
+];
 
 /// A `PackManifest` is the content of `pakf.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +40,18 @@ pub struct PackManifest {
     /// The packs that the pack depends on, by id, each with the oldest
     /// version that it works with.
     pub depends: BTreeMap<String, String>,
+    /// The `/`-rooted path of each editable file: a file of `files/` whose
+    /// content every project fills in, such as `/Cargo.toml`.
+    pub editable: BTreeSet<String>,
+}
+
+impl PackManifest {
+    /// `is_editable` returns whether the manifest declares the pack's file
+    /// `rel`, a path in the pack, editable.
+    pub fn is_editable(&self, rel: &str) -> bool {
+        rel.strip_prefix("files")
+            .is_some_and(|p| p.starts_with('/') && self.editable.contains(p))
+    }
 }
 
 /// `parse_manifest` reads the text of a manifest. `label` names the file in
@@ -74,6 +98,7 @@ pub fn parse_manifest(text: &str, label: &str) -> Result<PackManifest> {
         requires_pakf: get("requires-pakf")?,
         description: get("description")?,
         depends: depends(&doc, &fail)?,
+        editable: BTreeSet::new(),
     };
     if !is_pack_id(&manifest.name) {
         return Err(fail(not_an_id("the name", &manifest.name)));
@@ -88,7 +113,41 @@ pub fn parse_manifest(text: &str, label: &str) -> Result<PackManifest> {
             )));
         }
     }
+    let manifest = PackManifest {
+        editable: editable(&doc, &fail)?,
+        ..manifest
+    };
     Ok(manifest)
+}
+
+/// `editable` reads the optional `editable` of the manifest `doc`: a list
+/// of the `/`-rooted paths of files of `files/`. It refuses any other value
+/// and a path given twice, and leaves to the read of the pack's tree the
+/// refusal of a path that names no file of the pack.
+// sokf-implements: CONF-3_AC-11
+// sokf-implements: CONF-3_AC-12
+fn editable(doc: &Spanned, fail: &dyn Fn(String) -> Error) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    let Some(value) = doc.get(EDITABLE) else {
+        return Ok(out);
+    };
+    let not_paths = || {
+        fail(format!(
+            "`{EDITABLE}` is not a list of the `/`-rooted paths of files of `files/`, such as `[\"/Cargo.toml\"]`"
+        ))
+    };
+    let items = value.as_seq().ok_or_else(not_paths)?;
+    for item in items {
+        let path = item
+            .as_str()
+            .filter(|p| *p != "/" && crate::RepoPath::parse(p).is_some())
+            .ok_or_else(not_paths)?;
+        // sokf-implements: CONF-3_AC-13
+        if !out.insert(path.to_string()) {
+            return Err(fail(format!("`{EDITABLE}` names {path} twice")));
+        }
+    }
+    Ok(out)
 }
 
 /// `depends` reads the optional `depends` of the manifest `doc`: a map from
@@ -251,6 +310,48 @@ mod tests {
             let e = parse_manifest(&format!("{GOOD}{bad}"), "x/pakf.yaml").unwrap_err();
             assert!(e.to_string().contains("depends"), "{bad:?} -> {e}");
         }
+    }
+
+    // sokf-tests: CONF-3_AC-11
+    // sokf-tests: CONF-3_AC-12
+    // sokf-tests: CONF-3_AC-13
+    #[test]
+    fn a_manifest_reads_its_editable_files_as_exact_paths() {
+        let text = format!("{GOOD}editable:\n  - /Cargo.toml\n  - /docs/LICENSE\n");
+        let m = parse_manifest(&text, "pakf.yaml").unwrap();
+        assert_eq!(
+            m.editable,
+            BTreeSet::from(["/Cargo.toml".to_string(), "/docs/LICENSE".to_string()])
+        );
+        assert!(m.is_editable("files/Cargo.toml"));
+        assert!(m.is_editable("files/docs/LICENSE"));
+        assert!(!m.is_editable("files/docs"));
+        assert!(!m.is_editable("instructions.md"));
+        assert!(!m.is_editable("filesCargo.toml"));
+        assert!(
+            parse_manifest(GOOD, "pakf.yaml")
+                .unwrap()
+                .editable
+                .is_empty()
+        );
+        for bad in [
+            "editable: /Cargo.toml\n",
+            "editable: {a: b}\n",
+            "editable: [1]\n",
+            "editable: [Cargo.toml]\n",
+            "editable: [\"/\"]\n",
+            "editable: [/docs/]\n",
+            "editable: [/a/../b]\n",
+        ] {
+            let e = parse_manifest(&format!("{GOOD}{bad}"), "x/pakf.yaml")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("`editable` is not a list"), "{bad:?} -> {e}");
+        }
+        let e = parse_manifest(&format!("{GOOD}editable: [/a, /a]\n"), "x/pakf.yaml")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`editable` names /a twice"), "{e}");
     }
 
     // sokf-tests: CONF-3_AC-4

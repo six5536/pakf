@@ -170,6 +170,7 @@ mod tests {
                 requires_pakf: "0.1.0".into(),
                 description: "d".into(),
                 depends: BTreeMap::new(),
+                editable: BTreeSet::new(),
             },
             files: files
                 .iter()

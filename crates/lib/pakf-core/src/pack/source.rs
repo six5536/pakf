@@ -186,6 +186,21 @@ pub fn read_dir(dir: &Path, label: &str) -> Result<PackFiles> {
             old.join(" and ")
         )));
     }
+    // sokf-implements: CONF-3_AC-13
+    let missing: Vec<&str> = manifest
+        .editable
+        .iter()
+        .filter(|p| !files.contains_key(&in_files(p)))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::Pack(format!(
+            "{}: the `{}` of the manifest names {}, which no file of files/ holds",
+            manifest.name,
+            super::manifest::EDITABLE,
+            missing.join(", ")
+        )));
+    }
     // The caller reads the executable bits from git's tree.
     Ok(PackFiles {
         manifest,

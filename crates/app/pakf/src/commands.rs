@@ -20,7 +20,8 @@ use crate::{
 /// `add` use the network. `sync`, `add`, and `remove` exit with code 1 when
 /// a merge conflicts, or with the code of agent-harness-adapter where it is
 /// higher, `status --check` exits with code 1 when a file of a
-/// pack differs from its base and its acceptance isn't `accepted`, and every
+/// pack differs from its base, other than by the edit of an editable file,
+/// and its acceptance isn't `accepted`, and every
 /// command exits with code 2 when it refuses to run. With `--json`, each
 /// command that reports prints its report as one JSON value, with the same
 /// exit code, and with `--query`, the value that the expression selects from

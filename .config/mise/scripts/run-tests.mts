@@ -1,11 +1,14 @@
-// Runs the fast tests, the long tests when given `long`, or the tests that only CI can
-// run when given `ci`, and warns if the fast or the long tests take longer than their
+// Runs the fast tests, the long tests when given `long`, the tests that only CI can
+// run when given `ci`, or the tests that only a developer's machine runs when given
+// `local`, and warns if the fast, the long, or the local tests take longer than their
 // limit. Outside CI, it skips the CI tier and says so, because a test of that tier can
-// change the settings of the machine that it runs on. In CI, it runs the tests with
-// nextest's profile `ci`, which the Rust pack's `.config/nextest.toml` sets to report
-// every failure rather than stop at the first.
+// change the settings of the machine that it runs on. In CI, it skips the local tier
+// and says so, because a test of that tier, such as a measure of scale, would cost its
+// time on every platform of CI. In CI, it runs the tests with nextest's profile `ci`,
+// which the Rust pack's `.config/nextest.toml` sets to report every failure rather
+// than stop at the first.
 //
-// Usage: run-tests.mts [fast|long|ci]
+// Usage: run-tests.mts [fast|long|ci|local]
 
 import { spawnSync } from "node:child_process";
 import process from "node:process";
@@ -60,8 +63,19 @@ export function tierRun(tier: string | undefined, env: Env): TierRun {
         };
       }
       return { task: "test:ci:*" };
+    case "local": {
+      // The limit is read first, so that a bad one fails in CI too.
+      const run = limited("test:local:*", "TEST_LOCAL_TOTAL_SECONDS", 60, env);
+      if (inCi(env)) {
+        return {
+          skipped:
+            "test:local: skipped the local tier, because the variable CI is set; a developer's machine runs it.",
+        };
+      }
+      return run;
+    }
     default:
-      throw new RangeError(`the tier must be fast, long, or ci, not ${tier}`);
+      throw new RangeError(`the tier must be fast, long, ci, or local, not ${tier}`);
   }
 }
 

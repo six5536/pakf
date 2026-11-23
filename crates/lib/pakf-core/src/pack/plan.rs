@@ -14,6 +14,7 @@ use super::{
 };
 use crate::{Error, RepoPath, RepoRoot, Result};
 
+mod follow;
 mod moved;
 mod planner;
 
@@ -157,16 +158,20 @@ pub fn stays_for_owner(f: &LockedFile, dest: &RepoPath, owned_dests: &BTreeSet<R
     f.shadowed_by.is_some() || owned_dests.contains(dest)
 }
 
-/// `supply` returns each destination of the pack `fetched`.
+/// `supply` returns each destination of the pack `fetched`, and each
+/// destination of a file that it declares editable.
 pub fn supply(fetched: &Fetched) -> Supply {
-    let name = &fetched.pack.manifest.name;
-    let files = fetched
+    let manifest = &fetched.pack.manifest;
+    let dest = |rel: &String| RepoPath::parse(&destination(&manifest.name, &fetched.remap, rel)?);
+    let files = fetched.pack.files.keys().filter_map(dest).collect();
+    let editable = fetched
         .pack
         .files
         .keys()
-        .filter_map(|rel| RepoPath::parse(&destination(name, &fetched.remap, rel)?))
+        .filter(|rel| manifest.is_editable(rel))
+        .filter_map(dest)
         .collect();
-    Supply { files }
+    Supply { files, editable }
 }
 
 /// `plan` plans the sync of `fetched` into the repository. `own` says which

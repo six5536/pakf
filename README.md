@@ -46,7 +46,7 @@ pakf sync
 
 `pakf sync` merges each change of the pack into your edit of the file. When the two conflict, it leaves git's conflict markers in the file and exits with code 1, and you resolve the conflict as you would in a merge. A file of a pack that you deleted stays deleted.
 
-A check of the project, such as a commit hook or a CI job, runs `pakf status --check`, which fails while a file of a pack holds an edit that nobody has accepted. Run `pakf diff` to see your edits, `pakf accept PATH --note TEXT` to keep an edit on purpose, or `pakf patch NAME` to send it to the pack.
+A check of the project, such as a commit hook or a CI job, runs `pakf status --check`, which fails while a file of a pack holds an edit that nobody has accepted, other than the edit of an editable file. Run `pakf diff` to see your edits, `pakf accept PATH --note TEXT` to keep an edit on purpose, or `pakf patch NAME` to send it to the pack.
 
 ## Commands
 
@@ -86,29 +86,33 @@ packs/lint/
     └── .github/workflows/lint.yml
 ```
 
-The manifest gives the pack's id, its version, the oldest version of pakf that syncs it, its description, and the packs that it depends on:
+The manifest gives the pack's id, its version, the oldest version of pakf that syncs it, its description, the packs that it depends on, and its editable files:
 
 ```yaml
 name: "@acme/lint"
 version: 1.2.0
-requires-pakf: 0.1.0
+requires-pakf: 0.2.0
 description: "The house's lint configuration and its workflow."
 depends:
   "@acme/base": 1.0.0
+editable:
+  - /.config/lint.toml
 ```
 
-Quote each id, because YAML reads an unquoted `@` as a reserved character. pakf refuses a pack until the project declares each pack that it depends on, and syncs a pack after those packs. When two packs deliver a file at one path, the pack that comes later in the order owns the file, and `pakf status` lists the other pack's file as shadowed.
+Quote each id, because YAML reads an unquoted `@` as a reserved character. pakf refuses a pack until the project declares each pack that it depends on, and syncs a pack after those packs.
+
+`editable` lists, by their exact paths, the files of `files/` that every project fills in with its own content, such as a workspace `Cargo.toml` or a `LICENSE`. pakf still merges each change of the pack into such a file, and `pakf status`, `pakf ls`, and `pakf diff` show its edits, but its edit needs no acceptance: `pakf status` prints it as `edited /Cargo.toml (editable)`, `pakf status --check` passes on it unless it holds a conflict or is deleted, and `pakf patch` sends its edit only where a `PATH` names the file. A pack that declares editable files needs pakf 0.2.0. When two packs deliver a file at one path, the pack that comes later in the order owns the file, and `pakf status` lists the other pack's file as shadowed.
 
 ## Files of a project
 
 pakf keeps its own files in `/.pakf/`:
 
-| File                     | What it holds                                                                                                                                                                  |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `config.toml`            | The packs of the project, in order, each in a `[[pack]]` entry with its `name`, its `source`, and an optional `ref`, `path`, and `paths`, which remaps the paths of its files. |
-| `lock.toml`              | What each sync fetched: the commit and the version of each pack, and the path, the hash of the base, and the acceptance of each of its files. pakf writes it.                  |
-| `packs/@scope/name/`     | The base copy of each file of the pack in `base/`, from which `pakf sync` merges, and the copy of the pack's `instructions.md`. pakf writes it.                                |
-| `ignore` and `ignore.d/` | The new files that `pakf patch` leaves out of a patch, in the syntax of `.gitignore`: `ignore` is the project's list, and a pack ships its list in `ignore.d/@scope/name/`.    |
+| File                     | What it holds                                                                                                                                                                         |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config.toml`            | The packs of the project, in order, each in a `[[pack]]` entry with its `name`, its `source`, and an optional `ref`, `path`, and `paths`, which remaps the paths of its files.        |
+| `lock.toml`              | What each sync fetched: the commit and the version of each pack, and the path, the hash of the base, whether it is editable, and the acceptance of each of its files. pakf writes it. |
+| `packs/@scope/name/`     | The base copy of each file of the pack in `base/`, from which `pakf sync` merges, and the copy of the pack's `instructions.md`. pakf writes it.                                       |
+| `ignore` and `ignore.d/` | The new files that `pakf patch` leaves out of a patch, in the syntax of `.gitignore`: `ignore` is the project's list, and a pack ships its list in `ignore.d/@scope/name/`.           |
 
 This `[[pack]]` entry takes a pack from a git repository at a tag, and lands the pack's files of `/knowledge/` in `/docs/` instead:
 

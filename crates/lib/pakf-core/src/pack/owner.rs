@@ -15,6 +15,8 @@ use crate::RepoPath;
 pub struct Supply {
     /// Each destination.
     pub files: Vec<RepoPath>,
+    /// Each destination of a file that the pack declares editable.
+    pub editable: Vec<RepoPath>,
 }
 
 /// A `Shadow` says that another pack owns a destination of a pack.
@@ -22,6 +24,8 @@ pub struct Supply {
 pub struct Shadow {
     /// The pack that owns it.
     pub owner: String,
+    /// Whether the pack that owns it declares the file editable.
+    pub editable: bool,
 }
 
 /// A `Takeover` says that a pack owns a destination that another pack
@@ -36,10 +40,15 @@ pub struct Takeover {
     pub base: String,
     /// Whether that pack's version was executable.
     pub executable: bool,
+    /// Whether that pack declared the file editable.
+    pub editable: bool,
     /// Whether that pack's record holds an acceptance that the sync drops
     /// and no longer supplies the destination, so that the note of the drop
     /// falls to the pack that takes the file over.
     pub accepted: bool,
+    /// Whether that acceptance accepts a deletion, which still needs an
+    /// acceptance where the file is editable.
+    pub deletion: bool,
 }
 
 /// An `Ownership` is what one pack owns of what it supplies.
@@ -79,6 +88,9 @@ pub fn owners(
                     dest.clone(),
                     Shadow {
                         owner: owner.to_string(),
+                        editable: supplies
+                            .get(owner)
+                            .is_some_and(|s| s.editable.contains(dest)),
                     },
                 );
             } else if let Some((from, rel)) = old.owner_of(dest.as_str())
@@ -95,7 +107,9 @@ pub fn owners(
                         rel: rel.to_string(),
                         base: f.base.clone(),
                         executable: f.executable,
+                        editable: f.editable,
                         accepted: f.accepted.is_some() && !supplied,
+                        deletion: f.accepted.as_ref().is_some_and(|a| a.deleted),
                     },
                 );
             }
@@ -117,6 +131,7 @@ mod tests {
     fn supply(files: &[&str]) -> Supply {
         Supply {
             files: files.iter().map(|d| path(d)).collect(),
+            editable: Vec::new(),
         }
     }
 
@@ -131,6 +146,7 @@ mod tests {
                 executable: false,
                 shadowed_by: None,
                 changed: false,
+                editable: false,
                 accepted: None,
             },
         );
@@ -159,6 +175,7 @@ mod tests {
             base.shadowed[&path("/rustfmt.toml")],
             Shadow {
                 owner: "rust".into(),
+                editable: false,
             }
         );
         // Two schemas of one type at two paths are two files.

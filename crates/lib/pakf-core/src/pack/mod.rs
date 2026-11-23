@@ -28,8 +28,8 @@ pub use lock::{
     instructions_of, lock_path, lock_text, pack_dir, read_lock,
 };
 pub use manifest::{
-    MANIFEST, PackManifest, ids_named, is_pack_id, is_slug, parse_manifest, requires_newer,
-    split_id, tool_version,
+    EDITABLE, MANIFEST, PackManifest, ids_named, is_pack_id, is_slug, parse_manifest,
+    requires_newer, split_id, tool_version,
 };
 pub use mode::{carried_bit, carries_mode, file_is_executable, set_executable};
 pub use order::precedence;

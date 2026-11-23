@@ -59,8 +59,8 @@ impl PackAccepted {
 /// `pack_accept` records in the lock that the project keeps each file of
 /// `options.paths` as it stands, with the note, or withdraws the acceptance
 /// of each. It refuses, before it writes, a missing note, a path that no
-/// pack in the lock owns, a file that holds its base, and a file that holds
-/// a conflict.
+/// pack in the lock owns, a file that holds its base, a file that holds a
+/// conflict, and the edit of an editable file.
 // sokf-implements: CLI-6_AC-1
 // sokf-implements: CLI-6_AC-2
 // sokf-implements: CLI-6_AC-3
@@ -122,6 +122,15 @@ pub fn pack_accept(root: &RepoRoot, options: &PackAcceptOptions) -> Result<PackA
         {
             refused.push(format!(
                 "{dest}: the file holds a conflict; resolve it, then accept it"
+            ));
+            continue;
+        }
+        // An editable file's edit needs no acceptance, and its deletion
+        // still does.
+        // sokf-implements: CLI-6_AC-10
+        if bytes.is_some() && lock.packs[&name].files[&rel].editable {
+            refused.push(format!(
+                "{dest}: the pack {name} declares the file editable, and an editable file's edit needs no acceptance"
             ));
             continue;
         }

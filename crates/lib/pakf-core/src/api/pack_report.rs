@@ -14,7 +14,7 @@ use super::{
     pack::{PackSyncReport, SyncedPack, fixed_notes},
     pack_accept::PackAccepted,
     pack_info::{PackAcceptance, PackFileState, PackRemoved, PackStatus},
-    pack_ls::every_key_required,
+    pack_ls::{PackFileKind, every_key_required},
 };
 use crate::pack::FileAction;
 
@@ -47,6 +47,8 @@ pub struct StatusPack {
 pub struct StatusFile {
     /// The file's path from the repository root, such as `/LICENSE`.
     pub path: String,
+    /// The kind of the file, as `pakf ls --json` gives it.
+    pub kind: PackFileKind,
     /// The state of the file, whatever its acceptance.
     pub state: PackFileState,
     /// The acceptance of the file, `accepted` while it holds its accepted
@@ -213,6 +215,7 @@ impl PackStatus {
                         .iter()
                         .map(|f| StatusFile {
                             path: f.path.clone(),
+                            kind: f.kind,
                             state: f.state,
                             acceptance: f.acceptance,
                             note: f.note.clone(),

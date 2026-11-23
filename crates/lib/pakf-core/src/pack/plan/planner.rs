@@ -5,6 +5,7 @@ use std::{collections::BTreeSet, fs};
 
 use super::{
     Fetched, FileAction, PackPlan, Request,
+    follow::{Followed, follow_acceptance},
     moved::{Held, held},
 };
 use crate::{
@@ -152,10 +153,11 @@ impl<'a> Planner<'a> {
         // A shadowed record holds no acceptance, so a higher pack that
         // takes the file over drops it.
         // sokf-implements: CLI-2_AC-49
-        if wrote && old.is_some_and(|f| f.accepted.is_some()) {
+        if let Some(a) = old.and_then(|f| f.accepted.as_ref()).filter(|_| wrote) {
             self.out.notes.push(format!(
-                "note: the pack {} now owns {dest}, so the acceptance of its edit is dropped; accept it again if the project keeps the edit",
-                shadow.owner
+                "note: the pack {} now owns {dest}, so the acceptance of its edit is dropped; {}",
+                shadow.owner,
+                again(shadow.editable && !a.deleted)
             ));
         }
         // sokf-implements: CLI-2_AC-41
@@ -177,6 +179,10 @@ impl<'a> Planner<'a> {
                 executable: file.executable,
                 shadowed_by: Some(shadow.owner.clone()),
                 changed,
+                // The owner's record decides whether the file is editable, and
+                // this record keeps the pack's own declaration for a sync that
+                // reads the pack from the lock.
+                editable: self.fetched.pack.manifest.is_editable(file.rel),
                 accepted: None,
             },
         );
@@ -204,7 +210,9 @@ impl<'a> Planner<'a> {
         {
             self.conflicted.push(dest.to_string());
         }
-        let was = recorded.and_then(|f| f.accepted.clone());
+        let editable = self.fetched.pack.manifest.is_editable(rel);
+        let was =
+            self.editable_acceptance(&file, recorded.and_then(|f| f.accepted.clone()), editable);
         let held = was.as_ref().is_some_and(|a| {
             let bit = mode::carried_bit(rel, &file.current, &dest.to_fs(self.root));
             a.holds(&file.current, bit)
@@ -212,9 +220,10 @@ impl<'a> Planner<'a> {
         // An acceptance belongs to the owner's record, so a lower pack that
         // takes a file back from a higher pack, which no longer supplies it
         // or is removed, drops the higher pack's.
-        if takeover.is_some_and(|t| t.accepted) {
+        if let Some(t) = takeover.filter(|t| t.accepted) {
             self.out.notes.push(format!(
-                "note: the pack {name} now owns {dest}, so the acceptance of its edit is dropped; accept it again if the project keeps the edit"
+                "note: the pack {name} now owns {dest}, so the acceptance of its edit is dropped; {}",
+                again(editable && !t.deletion)
             ));
         }
         let action = self.content_action(&file, recorded, takeover)?;
@@ -265,6 +274,16 @@ impl<'a> Planner<'a> {
                 )
             })
         };
+        let was_editable = takeover.map_or(recorded.is_some_and(|f| f.editable), |t| t.editable);
+        // A deleted file needed an acceptance already, and an entry that
+        // isn't a readable regular file can't take one.
+        if was_editable && !editable && accepted.is_none() && action != Some(FileAction::Conflicted)
+        {
+            let differs = after
+                .as_deref()
+                .is_some_and(|b| !same_text(b, upstream) || mode.is_some_and(|m| m != executable));
+            self.note_no_longer_editable(dest, differs, takeover.is_some());
+        }
         let (base, recorded_bit) = kept.unwrap_or_else(|| {
             self.write_base(rel, upstream);
             (hash_of(upstream), executable)
@@ -277,10 +296,61 @@ impl<'a> Planner<'a> {
                 executable: recorded_bit,
                 shadowed_by: None,
                 changed: false,
+                editable,
                 accepted,
             },
         );
         Ok(())
+    }
+
+    /// `editable_acceptance` returns the acceptance `was` of the pack's file
+    /// `file`, or none where the pack declares the file editable, as
+    /// `editable` says, and `was` accepts its edit, or a deletion while a
+    /// file stands there again, because the edit then needs no acceptance,
+    /// with a note. An accepted deletion of an absent file stays, because a
+    /// deletion still needs one.
+    // sokf-implements: CLI-2_AC-82
+    fn editable_acceptance(
+        &mut self,
+        file: &Target,
+        was: Option<Accepted>,
+        editable: bool,
+    ) -> Option<Accepted> {
+        let dest = &file.dest;
+        let stands = matches!(file.current, Dest::File(_));
+        match was {
+            Some(a) if editable && (!a.deleted || stands) => {
+                self.out.notes.push(format!(
+                    "note: {dest} is an editable file of the pack {}, whose edit needs no acceptance, so the acceptance of its edit is dropped",
+                    self.name
+                ));
+                None
+            }
+            was => was,
+        }
+    }
+
+    /// `note_no_longer_editable` notes that the file `dest`, which the lock
+    /// recorded as editable and which its owner no longer declares so, needs
+    /// an acceptance of its edit, where a file stands there that `differs`
+    /// from its base. Where the pack takes the file over from another pack,
+    /// as `takeover` says, the note names the pack that now owns it.
+    // sokf-implements: CLI-2_AC-83
+    fn note_no_longer_editable(&mut self, dest: &RepoPath, differs: bool, takeover: bool) {
+        if !differs {
+            return;
+        }
+        let why = if takeover {
+            format!(
+                "the pack {} now owns {dest} and doesn't declare it editable",
+                self.name
+            )
+        } else {
+            format!("{dest} is no longer an editable file of its pack")
+        };
+        self.out.notes.push(format!(
+            "note: {why}, so its edit now needs an acceptance; accept it with `pakf accept` if the project keeps the edit"
+        ));
     }
 
     /// `kept_base` returns the base and the executable bit that the
@@ -658,89 +728,15 @@ fn dropped(
     Some((dest, action))
 }
 
-/// A `Followed` is what a sync did to one file of a pack that has an
-/// acceptance.
-struct Followed<'a> {
-    /// The file's destination.
-    dest: &'a RepoPath,
-    /// Whether the sync kept the file as a binary file that the project and
-    /// the pack both changed.
-    binary_kept: bool,
-    /// What the sync did to the file.
-    action: Option<FileAction>,
-    /// Whether the file held its accepted version before the sync.
-    held: bool,
-    /// The file's content after the sync, or none for a deleted file.
-    after: Option<&'a [u8]>,
-    /// The file's executable bit after the sync, for a file of `files/`.
-    bit: Option<bool>,
-    /// The pack's new version of the file.
-    upstream: &'a [u8],
-    /// Whether the pack's new version is executable.
-    executable: bool,
-    /// Whether the sync changed the pack's version of the file.
-    changed: bool,
-}
-
-/// `follow_acceptance` returns the acceptance `accepted` after the sync
-/// that `f` describes, and pushes a note for each acceptance that it drops
-/// or keeps against a change of the pack. A clean merge into the accepted
-/// version moves the acceptance to the merged file, because the project's
-/// lines are unchanged. A conflict, a merge into a file that changed since
-/// its acceptance, a binary file that the sync keeps against the pack's
-/// change, and a file that holds the pack's new version drop it.
-// sokf-implements: CLI-2_AC-44
-// sokf-implements: CLI-2_AC-45
-// sokf-implements: CLI-2_AC-46
-// sokf-implements: CLI-2_AC-47
-// sokf-implements: CLI-2_AC-48
-fn follow_acceptance(
-    accepted: Accepted,
-    f: &Followed,
-    notes: &mut Vec<String>,
-) -> Option<Accepted> {
-    let dest = f.dest;
-    let holds_base = f.after.is_some_and(|b| same_text(b, f.upstream))
-        && f.bit.is_none_or(|b| b == f.executable);
-    if holds_base {
-        return None;
-    }
-    match f.action {
-        Some(FileAction::Conflicted) => {
-            notes.push(format!(
-                "note: the merge into {dest} conflicts, so its acceptance is dropped; accept it again with `pakf accept` after you resolve the conflict"
-            ));
-            None
-        }
-        // A binary file that the project and the pack both changed takes
-        // its acceptance again against the pack's new version.
-        // sokf-implements: CLI-2_AC-28
-        _ if f.binary_kept => {
-            notes.push(format!(
-                "note: the pack changed the binary file {dest}, whose edit is accepted, so the acceptance is dropped; accept it again with `pakf accept` to keep your version"
-            ));
-            None
-        }
-        Some(FileAction::Merged) if !f.held => {
-            notes.push(format!(
-                "note: the sync merged the pack's change into {dest}, which changed since its acceptance, so the acceptance is dropped"
-            ));
-            None
-        }
-        _ => {
-            if accepted.deleted && f.after.is_none() && f.changed {
-                notes.push(format!(
-                    "note: the pack changed {dest}, whose deletion is accepted; the file stays deleted"
-                ));
-            }
-            // A file that held its accepted version follows the sync, as a
-            // clean merge or the pack's change of the executable bit.
-            Some(if f.held {
-                Accepted::of(f.after, f.bit.unwrap_or(false), &accepted.note)
-            } else {
-                accepted
-            })
-        }
+/// `again` returns the end of the note of an acceptance that a change of
+/// the file's owner drops: that the new owner's declaration of the file as
+/// editable makes the acceptance needless, as `editable` says, or else to
+/// accept the file again.
+fn again(editable: bool) -> &'static str {
+    if editable {
+        "the pack declares the file editable, whose edit needs no acceptance"
+    } else {
+        "accept it again if the project keeps the edit"
     }
 }
 

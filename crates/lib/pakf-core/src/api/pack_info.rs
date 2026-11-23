@@ -9,6 +9,7 @@ use serde::Serialize;
 use super::{
     pack::{SyncedPack, edited_files, fixed_notes, holds_accepted, is_edited, remove},
     pack_keep::PackKeep,
+    pack_ls::PackFileKind,
 };
 use crate::{Error, RepoPath, RepoRoot, Result, config, conflicts, pack, source::read_optional};
 
@@ -92,6 +93,8 @@ pub struct PackState {
 pub struct PackFile {
     /// The file's destination.
     pub path: String,
+    /// The file's kind, as `pakf ls` gives it.
+    pub kind: PackFileKind,
     /// The file's state.
     pub state: PackFileState,
     /// The file's acceptance, when the lock records one.
@@ -120,13 +123,16 @@ pub struct PackStatus {
 }
 
 impl PackStatus {
-    /// `drifted` returns whether a file of a pack is edited, conflicted, or
-    /// deleted, and its acceptance isn't `accepted`.
+    /// `drifted` returns whether a file of a pack is conflicted or deleted,
+    /// or edited and not editable, and its acceptance isn't `accepted`.
+    // sokf-implements: CLI-4_AC-3
     pub fn drifted(&self) -> bool {
         self.packs.iter().any(|p| {
             p.files.iter().any(|f| {
+                let editable = f.kind == PackFileKind::Editable && f.state == PackFileState::Edited;
                 f.state != PackFileState::Unchanged
                     && f.acceptance != Some(PackAcceptance::Accepted)
+                    && !editable
             })
         })
     }
@@ -148,10 +154,16 @@ impl PackStatus {
             // sokf-implements: CLI-4_AC-5
             // sokf-implements: CLI-4_AC-6
             // sokf-implements: CLI-4_AC-8
+            // sokf-implements: CLI-4_AC-15
             for f in &p.files {
                 let _ = write!(out, "{} {}", f.state.label(), f.path);
-                if let Some(acceptance) = f.acceptance {
-                    let _ = write!(out, " ({})", acceptance.label());
+                let marks: Vec<&str> = (f.kind == PackFileKind::Editable)
+                    .then(|| f.kind.label())
+                    .into_iter()
+                    .chain(f.acceptance.map(PackAcceptance::label))
+                    .collect();
+                if !marks.is_empty() {
+                    let _ = write!(out, " ({})", marks.join(", "));
                 }
                 if let Some(note) = &f.note {
                     let _ = write!(out, ": {note}");
@@ -194,6 +206,7 @@ pub fn pack_status(root: &RepoRoot) -> Result<PackStatus> {
                     let (state, acceptance) = file_state(root, rel, f)?;
                     (state != PackFileState::Unchanged || acceptance.is_some()).then(|| PackFile {
                         path: f.path.clone(),
+                        kind: PackFileKind::of(rel, f),
                         state,
                         acceptance,
                         note: f.accepted.as_ref().map(|a| a.note.clone()),

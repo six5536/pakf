@@ -15,8 +15,10 @@ use crate::{Error, RepoPath, RepoRoot, Result, source::read_optional};
 const HEADER: &str = "# pakf sync writes this file. Do not edit it.\n";
 
 /// `LOCK_VERSION` is the version of the lock's format that this tool reads
-/// and writes. A lock without `lock-version` has the version 1.
-pub const LOCK_VERSION: u32 = 1;
+/// and writes. A lock without `lock-version` has the version 1, and the
+/// version 2 adds `editable` to the record of a file, so this tool reads a
+/// lock of either version.
+pub const LOCK_VERSION: u32 = 2;
 
 /// `lock_path` returns the path of the lock.
 pub fn lock_path() -> RepoPath {
@@ -149,6 +151,10 @@ pub struct LockedFile {
     /// Whether the last sync changed this pack's version of a shadowed file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub changed: bool,
+    /// Whether the pack declares the file editable, so that its edit needs
+    /// no acceptance while the pack owns the file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub editable: bool,
     /// The edit or the deletion of the file that a maintainer accepted with
     /// `pakf accept`, so that `pakf status --check` passes on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -338,6 +344,7 @@ mod tests {
                 executable: false,
                 shadowed_by: None,
                 changed: false,
+                editable: false,
                 accepted: None,
             },
         );
@@ -349,6 +356,7 @@ mod tests {
                 executable: false,
                 shadowed_by: None,
                 changed: false,
+                editable: true,
                 accepted: Some(Accepted::of(Some(b"y\nz\n"), false, "the project's binary")),
             },
         );
@@ -356,7 +364,8 @@ mod tests {
         let text = lock_text(&lock).unwrap();
         assert!(text.starts_with(HEADER), "{text}");
         assert!(text.contains("[packs.\"@acme/method\"]"), "{text}");
-        assert!(text.contains("lock-version = 1\n"), "{text}");
+        assert!(text.contains("lock-version = 2\n"), "{text}");
+        assert!(text.contains("editable = true\n"), "{text}");
         assert!(text.contains("note = \"the project's binary\""), "{text}");
         assert!(!text.contains("deleted"), "{text}");
         assert!(!text.contains("executable"), "{text}");
@@ -405,6 +414,7 @@ mod tests {
             executable,
             shadowed_by: None,
             changed: false,
+            editable: false,
             accepted: None,
         };
         let (plain, script) = (record(false), record(true));
@@ -441,7 +451,18 @@ mod tests {
         .unwrap();
         let lock = read_lock(&root).unwrap();
         assert!(lock.packs.contains_key("@acme/p"));
-        assert!(lock_text(&lock).unwrap().contains("lock-version = 1\n"));
+        // A lock of the version 1, which pakf 0.1 wrote, reads, and is
+        // written again as the version 2.
+        assert!(lock_text(&lock).unwrap().contains("lock-version = 2\n"));
+        std::fs::write(
+            dir.join(".pakf/lock.toml"),
+            "lock-version = 1\n[packs.\"@acme/p\"]\nsource = \"x\"\ncommit = \"1\"\nversion = \"1\"\n",
+        )
+        .unwrap();
+        assert!(read_lock(&root).unwrap().packs.contains_key("@acme/p"));
+        std::fs::write(dir.join(".pakf/lock.toml"), "lock-version = 3\n").unwrap();
+        let e = read_lock(&root).unwrap_err().to_string();
+        assert!(e.contains("upgrade pakf"), "{e}");
         // A key that isn't an id is refused, a bare slug among them.
         for key in ["p", "\"acme/p\""] {
             std::fs::write(
@@ -481,7 +502,7 @@ mod tests {
                     proptest::option::of("[a-z]{1,6}"),
                     proptest::collection::btree_map(
                         "files/[a-z]{1,6}",
-                        ("/[a-z]{1,6}", proptest::prelude::any::<bool>(), proptest::option::of("[ -~]{0,10}")),
+                        ("/[a-z]{1,6}", proptest::prelude::any::<bool>(), proptest::prelude::any::<bool>(), proptest::option::of("[ -~]{0,10}")),
                         0..4,
                     ),
                 ),
@@ -492,7 +513,7 @@ mod tests {
             for ((scope, name), (source, git_ref, files)) in packs {
                 let files = files
                     .into_iter()
-                    .map(|(rel, (path, executable, note))| {
+                    .map(|(rel, (path, executable, editable, note))| {
                         let accepted = note.map(|n| Accepted::of(Some(b"x"), executable, &n));
                         (rel, LockedFile {
                             path,
@@ -500,6 +521,7 @@ mod tests {
                             executable,
                             shadowed_by: None,
                             changed: false,
+                            editable,
                             accepted,
                         })
                     })
