@@ -9,7 +9,6 @@ use super::pack::{is_edited, write_lock};
 use crate::{
     Error, RepoPath, RepoRoot, Result,
     config::PathArg,
-    conflicts,
     pack::{self, Accepted},
 };
 
@@ -37,6 +36,10 @@ pub struct PackAccepted {
     /// The note that the command recorded with each acceptance, or none
     /// with `--withdraw`.
     pub note: Option<String>,
+    /// A warning for each formatter or command of `[compare]` that was
+    /// missing, failed, or ran past its limit, which the command prints on
+    /// stderr, outside its JSON.
+    pub warnings: Vec<String>,
 }
 
 impl PackAccepted {
@@ -53,6 +56,32 @@ impl PackAccepted {
             out.push_str("no acceptance changed\n");
         }
         out
+    }
+}
+
+/// `unedited` returns the refusal of the unedited file at `dest`, the file
+/// `rel` of the pack `name` whose record is `record`: that it holds the
+/// pack's version, or, where its bytes differ from the base copy's, that it
+/// means the same.
+fn unedited(
+    root: &RepoRoot,
+    dest: &RepoPath,
+    name: &str,
+    rel: &str,
+    record: &pack::LockedFile,
+) -> String {
+    let laid = match pack::read_dest(root, dest) {
+        pack::Dest::File(b) => {
+            !pack::is_base(&b, &record.base)
+                && std::fs::read(pack::base_path(name, rel).to_fs(root))
+                    .is_ok_and(|base| pack::normalise(&base) != pack::normalise(&b))
+        }
+        _ => false,
+    };
+    if laid {
+        format!("{dest}: the file means the same as the pack's version")
+    } else {
+        format!("{dest}: the file holds the pack's version")
     }
 }
 
@@ -75,7 +104,34 @@ pub fn pack_accept(root: &RepoRoot, options: &PackAcceptOptions) -> Result<PackA
                 .into(),
         ));
     }
+    // The lock is the one file that an acceptance writes, and the
+    // configuration sets its comparison.
+    // sokf-implements: CLI-2_AC-90
+    super::pack::refuse_own_links(root)?;
     let mut lock = pack::read_lock(root)?;
+    // An acceptance is a line of the lock, so it is recorded by the
+    // library's own reading alone; the reading of `pakf status` is opened
+    // only for a file that the first reads as unedited, so that `pakf
+    // accept` never refuses a file that `pakf status` reports as edited.
+    let meaning = pack::Meaning::open(root, pack::For::Writes)?;
+    let reports = pack::Meaning::open(root, pack::For::Reports)?;
+    let accepted = accept(root, options, note, &mut lock, &meaning, &reports);
+    meaning.finish();
+    reports.settle(accepted, |r, w| r.warnings = w)
+}
+
+/// `accept` records the acceptances of `pack_accept` in the lock `lock`,
+/// with the library's own reading `meaning` and the reading of `pakf
+/// status` `reports`, and returns the report without its warnings, which
+/// `pack_accept` adds.
+fn accept(
+    root: &RepoRoot,
+    options: &PackAcceptOptions,
+    note: &str,
+    lock: &mut pack::Lock,
+    meaning: &pack::Meaning,
+    reports: &pack::Meaning,
+) -> Result<PackAccepted> {
     let mut refused = Vec::new();
     let mut targets: Vec<(RepoPath, String, String, Option<Accepted>)> = Vec::new();
     for arg in &options.paths {
@@ -98,10 +154,12 @@ pub fn pack_accept(root: &RepoRoot, options: &PackAcceptOptions) -> Result<PackA
             targets.push((dest, name, rel, None));
             continue;
         }
-        if !is_edited(root, &rel, &lock.packs[&name].files[&rel]) {
-            refused.push(format!(
-                "{dest}: the file holds the pack's version, so there is no edit to accept"
-            ));
+        let record = &lock.packs[&name].files[&rel];
+        // sokf-implements: CLI-1_AC-43
+        if !is_edited(root, meaning, &name, &rel, record)
+            && !is_edited(root, reports, &name, &rel, record)
+        {
+            refused.push(unedited(root, &dest, &name, &rel, record));
             continue;
         }
         let path = dest.to_fs(root);
@@ -109,7 +167,7 @@ pub fn pack_accept(root: &RepoRoot, options: &PackAcceptOptions) -> Result<PackA
         // holds no version to accept.
         // sokf-implements: CLI-2_AC-57
         // sokf-implements: CLI-6_AC-9
-        let bytes = match pack::read_dest(&path) {
+        let bytes = match pack::read_dest(root, &dest) {
             pack::Dest::File(b) => Some(b),
             pack::Dest::Absent => None,
             pack::Dest::Unreadable(why) => {
@@ -117,8 +175,9 @@ pub fn pack_accept(root: &RepoRoot, options: &PackAcceptOptions) -> Result<PackA
                 continue;
             }
         };
+        // sokf-implements: CLI-6_AC-4
         if let Some(b) = &bytes
-            && !conflicts::conflict_lines(&dest, &String::from_utf8_lossy(b)).is_empty()
+            && record.holds_conflict(root, &name, &rel, b)
         {
             refused.push(format!(
                 "{dest}: the file holds a conflict; resolve it, then accept it"
@@ -130,17 +189,13 @@ pub fn pack_accept(root: &RepoRoot, options: &PackAcceptOptions) -> Result<PackA
         // sokf-implements: CLI-6_AC-10
         if bytes.is_some() && lock.packs[&name].files[&rel].editable {
             refused.push(format!(
-                "{dest}: the pack {name} declares the file editable, and an editable file's edit needs no acceptance"
+                "{dest}: the file is editable in the pack {name} and needs no acceptance"
             ));
             continue;
         }
         let bit = bytes.is_some() && pack::carries_mode(&rel) && pack::file_is_executable(&path);
-        targets.push((
-            dest,
-            name,
-            rel,
-            Some(Accepted::of(bytes.as_deref(), bit, note)),
-        ));
+        let accepted = Accepted::of(bytes.as_deref(), bit, note, &dest, meaning);
+        targets.push((dest, name, rel, Some(accepted)));
     }
     if !refused.is_empty() {
         return Err(Error::Pack(refused.join("; ")));
@@ -170,7 +225,7 @@ pub fn pack_accept(root: &RepoRoot, options: &PackAcceptOptions) -> Result<PackA
         }
     }
     if changed {
-        write_lock(root, &lock)?;
+        write_lock(root, lock)?;
     }
     Ok(report)
 }

@@ -312,6 +312,10 @@ pub struct PackLs {
     /// Whether the text names each directory above its entries, as `ls`
     /// does for more than one path and with `-R`.
     pub headers: bool,
+    /// A warning for each formatter or command of `[compare]` that was
+    /// missing, failed, or ran past its limit, which the command prints on
+    /// stderr, outside its JSON.
+    pub warnings: Vec<String>,
 }
 
 impl PackLs {
@@ -345,7 +349,11 @@ struct Record {
 // sokf-implements: CLI-5_AC-8
 // sokf-implements: CLI-5_AC-25
 // sokf-implements: CLI-5_AC-26
-fn records(root: &RepoRoot, lock: &pack::Lock) -> BTreeMap<String, Record> {
+fn records(
+    root: &RepoRoot,
+    meaning: &pack::Meaning,
+    lock: &pack::Lock,
+) -> BTreeMap<String, Record> {
     let mut owned = BTreeMap::new();
     for name in pack::ordered(root, lock) {
         let Some(p) = lock.packs.get(&name) else {
@@ -355,7 +363,7 @@ fn records(root: &RepoRoot, lock: &pack::Lock) -> BTreeMap<String, Record> {
             let kind = PackFileKind::of(rel, f);
             // `file_state` gives no state to a shadowed record, whose file
             // the record of its owner describes.
-            let Some((state, acceptance)) = file_state(root, rel, f) else {
+            let Some((state, acceptance)) = file_state(root, meaning, &name, rel, f) else {
                 continue;
             };
             // The note belongs to the acceptance, `accepted` or `stale`, as
@@ -644,10 +652,23 @@ fn directory_state(records: &[&Record]) -> (Option<PackLsState>, Option<PackAcce
 // sokf-implements: CLI-5_AC-23
 pub fn pack_ls(root: &RepoRoot, options: &PackLsOptions) -> Result<PackLs> {
     let lock = pack::read_lock(root)?;
+    let meaning = pack::Meaning::open(root, pack::For::Reports)?;
+    let listed = listing(root, options, &lock, &meaning);
+    meaning.settle(listed, |r, w| r.warnings = w)
+}
+
+/// `listing` returns the listing of `pack_ls` of the lock `lock`, with the
+/// comparison `meaning`, without its warnings, which `pack_ls` adds.
+fn listing(
+    root: &RepoRoot,
+    options: &PackLsOptions,
+    lock: &pack::Lock,
+    meaning: &pack::Meaning,
+) -> Result<PackLs> {
     let mut lister = Lister {
         root,
         options,
-        records: records(root, &lock),
+        records: records(root, meaning, lock),
         ignored: None,
     };
     let mut refused = Vec::new();
@@ -715,7 +736,11 @@ pub fn pack_ls(root: &RepoRoot, options: &PackLsOptions) -> Result<PackLs> {
     for dir in &dirs {
         lister.list_dir(dir, &mut listings);
     }
-    Ok(PackLs { listings, headers })
+    Ok(PackLs {
+        listings,
+        headers,
+        warnings: Vec::new(),
+    })
 }
 
 #[cfg(test)]

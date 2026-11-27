@@ -42,6 +42,9 @@ pub struct Takeover {
     pub executable: bool,
     /// Whether that pack declared the file editable.
     pub editable: bool,
+    /// Whether that pack's last sync left a conflict in the file, as
+    /// `LockedFile::left_conflict` says.
+    pub conflicted: bool,
     /// Whether that pack's record holds an acceptance that the sync drops
     /// and no longer supplies the destination, so that the note of the drop
     /// falls to the pack that takes the file over.
@@ -108,6 +111,7 @@ pub fn owners(
                         base: f.base.clone(),
                         executable: f.executable,
                         editable: f.editable,
+                        conflicted: f.left_conflict(),
                         accepted: f.accepted.is_some() && !supplied,
                         deletion: f.accepted.as_ref().is_some_and(|a| a.deleted),
                     },
@@ -142,11 +146,12 @@ mod tests {
             "files/rustfmt.toml".into(),
             LockedFile {
                 path: dest.into(),
-                base: "fnv1a64:1".into(),
+                base: crate::pack::hash_of(b"x"),
                 executable: false,
                 shadowed_by: None,
                 changed: false,
                 editable: false,
+                conflicted: false,
                 accepted: None,
             },
         );

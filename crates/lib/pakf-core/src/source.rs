@@ -1,22 +1,10 @@
 //! The `source` module holds the helpers that read the files of the
-//! repository: the hash of a file's bytes, the line ending of a file's first
-//! line, and the read of a file that may be absent.
+//! repository: the line ending of a file's first line, and the read of a
+//! file that may be absent.
 
 use std::{fs, path::Path};
 
 use crate::{Error, Result};
-
-/// `fnv1a64` returns the 64-bit FNV-1a hash of `bytes`. The tool uses one
-/// hash, because FNV-1a gives the same value on every Rust version, so a
-/// lock stays valid after the toolchain changes.
-pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
-    }
-    h
-}
 
 /// `LineEnding` is the line ending of a file's first line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,12 +39,6 @@ pub(crate) fn read_optional(fs_path: &Path) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_hash_is_fnv1a() {
-        assert_eq!(fnv1a64(b""), 0xCBF2_9CE4_8422_2325);
-        assert_eq!(fnv1a64(b"a"), 0xAF63_DC4C_8601_EC8C);
-    }
 
     #[test]
     fn the_line_ending_is_the_first_lines() {

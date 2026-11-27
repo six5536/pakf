@@ -40,8 +40,9 @@ pub struct PackEntry {
 // sokf:end config-pack
 
 /// `PacksFile` is the part of the configuration that this module reads: the
-/// `[[pack]]` entries, and no other key, such as a table that
-/// agent-harness-adapter reads for pakf.
+/// `[[pack]]` entries, and no other key, such as the table `[compare]`,
+/// which the module `compare` reads, or a table that agent-harness-adapter
+/// reads for pakf.
 // sokf-implements: CONF-1_AC-6
 #[derive(Debug, Default, Deserialize)]
 struct PacksFile {
@@ -133,7 +134,7 @@ fn parse_packs(root: &RepoRoot) -> Result<PacksFile> {
         return Err(Error::config(
             path,
             format!(
-                "the [[pack]] entry of {name} names `store`, which pakf no longer reads; a pack is one tree of files, so move the pack's files under files/ at the paths where they land, remove `store`, and remap a prefix with `paths` where the project keeps the files elsewhere"
+                "the [[pack]] entry of {name} names `store`, which pakf no longer reads; move the pack's files under files/ at the paths where they land, remove `store`, and remap a prefix with `paths` where the project keeps the files elsewhere"
             ),
         ));
     }

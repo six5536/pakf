@@ -181,7 +181,7 @@ pub fn read_dir(dir: &Path, label: &str) -> Result<PackFiles> {
     let old = old_layout(&files);
     if !old.is_empty() {
         return Err(Error::Pack(format!(
-            "{}: the pack holds {} at its root, which pakf no longer reads; a pack is one tree of files, so move each file under files/ at the path where it lands, such as schemas/issue.md to files/knowledge/schemas/issue.md",
+            "{}: the pack holds {} at its root, which pakf no longer reads; move each file under files/ at the path where it lands, such as schemas/issue.md to files/knowledge/schemas/issue.md",
             manifest.name,
             old.join(" and ")
         )));
@@ -263,7 +263,7 @@ pub fn clone_dir(worktree: &Path, path: &str) -> Result<std::path::PathBuf> {
         };
         if meta.file_type().is_symlink() {
             return Err(Error::Pack(format!(
-                "--path {path}: {segment} is a symbolic link, so the path can leave the repository"
+                "--path {path}: --path doesn't go through the symbolic link {segment}"
             )));
         }
     }

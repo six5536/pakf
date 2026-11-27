@@ -134,12 +134,15 @@ pub struct PackSyncJson {
     pub undeclared: Vec<RemovedPack>,
     /// Each pack that the command wrote, in the order of the text.
     pub packs: Vec<WrittenPack>,
-    /// The report of agent-harness-adapter on pakf's block, as it stands,
-    /// and an empty string when the command handed the adapter nothing.
+    /// The report of agent-harness-adapter on pakf's block, as it stands
+    /// apart from a warning that names the adapter's forced install, which
+    /// pakf gives in its own words, and an empty string when the command
+    /// handed the adapter nothing.
     pub instructions: String,
     /// The notes of the text for a person, in the order of the text,
     /// without the `note: ` before each, such as an acceptance that the sync
-    /// dropped, and a block that the command kept as it stands.
+    /// dropped, and a block that the command kept as it stands, other than
+    /// the note that ends `instructions`.
     pub notes: Vec<String>,
 }
 
@@ -162,13 +165,15 @@ pub struct PackRemoveJson {
     /// Each pack that took over a file of the removed pack, with what the
     /// command did to each file.
     pub packs: Vec<WrittenPack>,
-    /// The report of agent-harness-adapter on pakf's block, as it stands,
-    /// and an empty string when the command handed the adapter nothing.
+    /// The report of agent-harness-adapter on pakf's block, as it stands
+    /// apart from a warning that names the adapter's forced install, which
+    /// pakf gives in its own words, and an empty string when the command
+    /// handed the adapter nothing.
     pub instructions: String,
     /// The notes of the text for a person, in the order of the text,
     /// without the `note: ` before each, such as the note that names the
     /// base copy of a deleted file, and a block that the command kept as it
-    /// stands.
+    /// stands, other than the note that ends `instructions`.
     pub notes: Vec<String>,
 }
 
@@ -257,6 +262,7 @@ impl PackSyncReport {
             notes: pack_notes(&self.packs)
                 .chain(self.instructions.held.clone())
                 .chain(fixed_notes(&self.packs).into_iter().map(str::to_string))
+                .chain(self.still_conflicted_note())
                 .collect(),
         }
     }
@@ -281,6 +287,7 @@ impl PackRemoved {
             notes: pack_notes(&self.handed)
                 .chain(self.instructions.held.clone())
                 .chain(fixed_notes(&self.handed).into_iter().map(str::to_string))
+                .chain(self.still_conflicted_note())
                 .collect(),
         }
     }

@@ -29,7 +29,22 @@ use crate::{
 /// expression fails first.
 // sokf-implements: CLI-2_AC-9
 pub fn run(repo_root: Option<&Path>, command: Command) -> pakf_core::Result<u8> {
-    let (text, code) = match command {
+    // A command that fails after its comparison warned prints the warnings
+    // before its error.
+    // sokf-implements: CLI-1_AC-45
+    let (text, code) = outcome(repo_root, command).map_err(|e| {
+        let (warnings, error) = e.into_warnings();
+        warn(&warnings);
+        error
+    })?;
+    output::write_stdout(text.as_bytes())?;
+    Ok(code)
+}
+
+/// `outcome` runs the command `command` and returns its text and its exit
+/// code.
+fn outcome(repo_root: Option<&Path>, command: Command) -> pakf_core::Result<(String, u8)> {
+    Ok(match command {
         Command::Sync(a) => sync(repo_root, a)?,
         Command::Add(a) => add(repo_root, a)?,
         Command::Status(a) => status(repo_root, &a)?,
@@ -53,12 +68,11 @@ pub fn run(repo_root: Option<&Path>, command: Command) -> pakf_core::Result<u8> 
             for note in &diff.notes {
                 eprintln!("note: pakf diff: {note}");
             }
+            warn(&diff.warnings);
             (diff.patch, output::EXIT_OK)
         }
         Command::Patch(a) => patch(repo_root, a)?,
-    };
-    output::write_stdout(text.as_bytes())?;
-    Ok(code)
+    })
 }
 
 /// `patch` makes the patch of the pack that `args` names, and prints it,
@@ -84,6 +98,7 @@ fn patch(repo_root: Option<&Path>, args: PackPatchArgs) -> pakf_core::Result<(St
     for note in &patch.notes {
         eprintln!("note: pakf patch: {note}");
     }
+    warn(&patch.warnings);
     if let Some(file) = file {
         std::fs::write(&file, &patch.patch).map_err(|e| Error::io(&file, e))?;
         return Ok((String::new(), output::EXIT_OK));
@@ -154,6 +169,7 @@ fn status(repo_root: Option<&Path>, args: &PackStatusArgs) -> pakf_core::Result<
     let query = args.query.as_deref().map(Expr::compile).transpose()?;
     let (_, root) = output::root(repo_root)?;
     let status = pakf_core::pack_status(&root)?;
+    warn(&status.warnings);
     // sokf-implements: CLI-4_AC-3
     let code = if args.check && status.drifted() {
         output::EXIT_ERRORS
@@ -180,6 +196,7 @@ fn accept(repo_root: Option<&Path>, args: PackAcceptArgs) -> pakf_core::Result<(
             cwd,
         },
     )?;
+    warn(&report.warnings);
     let text = if args.json {
         output::json_text(&report.to_json(), None)?
     } else {
@@ -208,6 +225,16 @@ fn remove(repo_root: Option<&Path>, args: PackRemoveArgs) -> pakf_core::Result<(
         report.to_text()
     };
     Ok((text, code))
+}
+
+/// `warn` prints on stderr, outside the JSON of the command, each warning of
+/// a formatter or a command of `[compare]` that was missing, failed, or ran
+/// past its limit.
+// sokf-implements: CLI-1_AC-44
+fn warn(warnings: &[String]) {
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
 }
 
 /// `keep` returns the parts that the values of `--keep` name: each part that
@@ -243,6 +270,7 @@ fn ls(repo_root: Option<&Path>, args: PackLsArgs) -> pakf_core::Result<(String, 
             acceptance: args.acceptance.map(acceptance),
         },
     )?;
+    warn(&report.warnings);
     let text = if args.json {
         output::json_text(&report.to_json(), query.as_ref())?
     } else {

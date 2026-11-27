@@ -1,7 +1,7 @@
 {
   "name": "@six5536/pakf",
-  "version": "0.2.0",
-  "description": "pakf shares project files through packs. It copies the files of each pack into a project, records the base of each file in a lock, and merges each later change of a pack into the project's own edits.",
+  "version": "0.3.0",
+  "description": "pakf shares project files through packs. It copies the files of each pack into a project, records the base of each file in a lock, and merges each later change of a pack into the project's own edits. Unstable: its commands, options and file formats can change in any release.",
   "keywords": [
     "cli",
     "command-line",
@@ -36,11 +36,11 @@
     "test": "node --test test/*.test.js"
   },
   "optionalDependencies": {
-    "@six5536/pakf-darwin-arm64": "0.2.0",
-    "@six5536/pakf-darwin-x64": "0.2.0",
-    "@six5536/pakf-linux-arm64": "0.2.0",
-    "@six5536/pakf-linux-x64": "0.2.0",
-    "@six5536/pakf-win32-x64": "0.2.0"
+    "@six5536/pakf-darwin-arm64": "0.3.0",
+    "@six5536/pakf-darwin-x64": "0.3.0",
+    "@six5536/pakf-linux-arm64": "0.3.0",
+    "@six5536/pakf-linux-x64": "0.3.0",
+    "@six5536/pakf-win32-x64": "0.3.0"
   },
   "engines": {
     "node": ">=18"

@@ -8,18 +8,21 @@ use super::{
     landing,
     lock::{Lock, LockedFile, LockedPack},
     manifest::{requires_newer, tool_version},
+    meaning::Meaning,
     owner::{Ownership, Supply},
     remap::Remap,
     source::{PackFiles, Source, destination},
 };
 use crate::{Error, RepoPath, RepoRoot, Result};
 
+mod compared;
+mod dropped;
 mod follow;
 mod moved;
 mod planner;
 
+pub use dropped::dropping;
 use planner::Planner;
-pub use planner::dropping;
 
 /// `pack_error` returns the error `m` of the sync of the pack `name`, which
 /// names the pack first.
@@ -132,6 +135,9 @@ pub struct PackPlan {
     /// destination, such as that the project and the pack both changed a
     /// binary file that the sync kept.
     pub reasons: BTreeMap<RepoPath, String>,
+    /// Each file whose record the sync drops, because the pack no longer
+    /// holds it there, and that it keeps while the file holds a conflict.
+    pub still_conflicted: Vec<RepoPath>,
 }
 
 /// A `Request` holds the options of a sync that apply to one pack.
@@ -174,7 +180,8 @@ pub fn supply(fetched: &Fetched) -> Supply {
     Supply { files, editable }
 }
 
-/// `plan` plans the sync of `fetched` into the repository. `own` says which
+/// `plan` plans the sync of `fetched` into the repository, with the
+/// comparison `meaning` of the command. `own` says which
 /// of its destinations another pack owns, and which it takes over from
 /// another pack. It refuses the sync, with no file written, when the pack
 /// needs a newer pakf, when a file lands on an existing file that the lock
@@ -191,6 +198,7 @@ pub fn supply(fetched: &Fetched) -> Supply {
 // sokf-implements: CLI-2_AC-19
 pub fn plan(
     root: &RepoRoot,
+    meaning: &Meaning,
     lock: &Lock,
     fetched: &Fetched,
     request: &Request,
@@ -217,9 +225,11 @@ pub fn plan(
         modes: Vec::new(),
         notes: Vec::new(),
         reasons: BTreeMap::new(),
+        still_conflicted: Vec::new(),
     };
     let mut planner = Planner {
         root,
+        meaning,
         fetched,
         request,
         own,

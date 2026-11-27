@@ -3,12 +3,18 @@ resolver = "3"
 members = ["crates/*/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.99.1"
 
 [workspace.dependencies]
-pakf-core = { path = "crates/lib/pakf-core", version = "0.2.0" }
+pakf-core = { path = "crates/lib/pakf-core", version = "0.3.0" }
+# The comparison of a pack's files by their meaning, with JavaScript and
+# TypeScript, which need Rust 1.98, a configured formatter or command, the
+# detection of the project's formatter, and the cache in a folder. Cargo reads
+# each 0.x minor version as a library of its own, so agent-harness-adapter-core
+# requires the same minor version, and the build holds one copy of the library.
+same-same = { version = "0.1.0", features = ["javascript", "command", "detect", "cache"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -29,7 +35,7 @@ similar_names = "allow"
 
 # Optimise release builds for size
 [profile.release]
-opt-level = "z" # optimise for size rather than speed
+opt-level = 2 # optimise for speed; 3 gains little for a longer build, and "z" is for a WASM build alone
 strip = true # strip the debug information and symbols
 lto = true # optimise at link time across all the crates
 panic = "abort" # abort on a panic, without the cost of unwinding

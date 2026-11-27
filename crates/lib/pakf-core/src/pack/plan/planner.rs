@@ -10,12 +10,12 @@ use super::{
 };
 use crate::{
     Error, RepoPath, RepoRoot, Result,
-    conflicts::conflict_lines,
     pack::{
         dest::{Dest, empties, entry_above, read_dest},
-        eol::{is_base, is_binary, keep_ending, normalise, same_text},
+        eol::{is_binary, keep_ending, normalise, same_text},
         git,
-        lock::{Accepted, LockedFile, LockedPack, base_path, hash_of},
+        lock::{Accepted, LockedFile, LockedPack, base_path, hash_of, holds_conflict},
+        meaning::Meaning,
         mode::{self, carries_mode, file_is_executable},
         owner::{Ownership, Shadow, Takeover},
         source::FILES,
@@ -27,6 +27,8 @@ use crate::{
 pub(super) struct Planner<'a> {
     /// The repository.
     pub(super) root: &'a RepoRoot,
+    /// The comparison of the command.
+    pub(super) meaning: &'a Meaning,
     /// The pack.
     pub(super) fetched: &'a Fetched,
     /// The options of the sync.
@@ -97,7 +99,7 @@ impl<'a> Planner<'a> {
         let current = if gone(&dest) {
             Dest::Absent
         } else {
-            match read_dest(&dest.to_fs(self.root)) {
+            match read_dest(self.root, &dest) {
                 // sokf-implements: CLI-2_AC-65
                 Dest::Unreadable(_) if empties(self.root, &dest, &gone) => Dest::Absent,
                 d => d,
@@ -118,7 +120,7 @@ impl<'a> Planner<'a> {
                         // destination of a moved file, so the working tree
                         // decides whether the project deleted it.
                         && RepoPath::parse(&f.path)
-                            .is_some_and(|p| read_dest(&p.to_fs(self.root)) == Dest::Absent);
+                            .is_some_and(|p| read_dest(self.root, &p) == Dest::Absent);
                     if carried {
                         self.carried.insert(rel.to_string());
                     }
@@ -148,14 +150,14 @@ impl<'a> Planner<'a> {
     // sokf-implements: CLI-2_AC-40
     pub(super) fn shadowed(&mut self, file: &Target, shadow: &Shadow) {
         let (name, dest, old, upstream) = (self.name, &file.dest, file.old, file.upstream);
-        let changed = old.is_some_and(|f| f.base != hash_of(upstream));
+        let changed = old.is_some_and(|f| self.changes(&f.base, name, file.rel, dest, upstream));
         let wrote = old.is_some_and(|f| f.shadowed_by.is_none());
         // A shadowed record holds no acceptance, so a higher pack that
         // takes the file over drops it.
         // sokf-implements: CLI-2_AC-49
         if let Some(a) = old.and_then(|f| f.accepted.as_ref()).filter(|_| wrote) {
             self.out.notes.push(format!(
-                "note: the pack {} now owns {dest}, so the acceptance of its edit is dropped; {}",
+                "note: the pack {} now owns {dest}, and the acceptance of its edit is dropped; {}",
                 shadow.owner,
                 again(shadow.editable && !a.deleted)
             ));
@@ -183,6 +185,7 @@ impl<'a> Planner<'a> {
                 // this record keeps the pack's own declaration for a sync that
                 // reads the pack from the lock.
                 editable: self.fetched.pack.manifest.is_editable(file.rel),
+                conflicted: false,
                 accepted: None,
             },
         );
@@ -202,27 +205,20 @@ impl<'a> Planner<'a> {
         let recorded = file.old.filter(|f| f.shadowed_by.is_none());
         let takeover = self.own.takeover.get(dest);
         let mode = self.planned_mode(&file, recorded, takeover);
-        if (recorded.is_some() || takeover.is_some())
-            && file
-                .current
-                .bytes()
-                .is_some_and(|c| !conflict_lines(dest, &String::from_utf8_lossy(c)).is_empty())
-        {
-            self.conflicted.push(dest.to_string());
-        }
+        self.note_conflict(&file, recorded, takeover);
         let editable = self.fetched.pack.manifest.is_editable(rel);
         let was =
             self.editable_acceptance(&file, recorded.and_then(|f| f.accepted.clone()), editable);
         let held = was.as_ref().is_some_and(|a| {
             let bit = mode::carried_bit(rel, &file.current, &dest.to_fs(self.root));
-            a.holds(&file.current, bit)
+            a.holds(&file.current, bit, dest, self.meaning)
         });
         // An acceptance belongs to the owner's record, so a lower pack that
         // takes a file back from a higher pack, which no longer supplies it
         // or is removed, drops the higher pack's.
         if let Some(t) = takeover.filter(|t| t.accepted) {
             self.out.notes.push(format!(
-                "note: the pack {name} now owns {dest}, so the acceptance of its edit is dropped; {}",
+                "note: the pack {name} now owns {dest}, and the acceptance of its edit is dropped; {}",
                 again(editable && !t.deletion)
             ));
         }
@@ -241,7 +237,7 @@ impl<'a> Planner<'a> {
         }
         let unreadable = matches!(file.current, Dest::Unreadable(_));
         let kept = if unreadable {
-            Self::kept_base(&file, recorded, takeover)
+            self.kept_base(&file, recorded, takeover)
         } else {
             None
         };
@@ -256,7 +252,10 @@ impl<'a> Planner<'a> {
         let accepted = if unreadable {
             was
         } else {
+            // Only a file with an acceptance asks the meaning of the change.
             was.and_then(|a| {
+                let (holds_new, changed) =
+                    self.news(dest, rel, upstream, recorded, after.as_deref());
                 follow_acceptance(
                     a,
                     &Followed {
@@ -264,12 +263,13 @@ impl<'a> Planner<'a> {
                         action,
                         held,
                         after: after.as_deref(),
+                        holds_new,
                         bit: mode,
-                        upstream,
                         executable,
-                        changed: recorded.is_some_and(|f| f.base != hash_of(upstream)),
+                        changed,
                         binary_kept: self.binary_kept.contains(dest),
                     },
+                    self.meaning,
                     &mut self.out.notes,
                 )
             })
@@ -279,9 +279,9 @@ impl<'a> Planner<'a> {
         // isn't a readable regular file can't take one.
         if was_editable && !editable && accepted.is_none() && action != Some(FileAction::Conflicted)
         {
-            let differs = after
-                .as_deref()
-                .is_some_and(|b| !same_text(b, upstream) || mode.is_some_and(|m| m != executable));
+            let differs = after.as_deref().is_some_and(|b| {
+                !self.means(dest, b, upstream) || mode.is_some_and(|m| m != executable)
+            });
             self.note_no_longer_editable(dest, differs, takeover.is_some());
         }
         let (base, recorded_bit) = kept.unwrap_or_else(|| {
@@ -297,10 +297,35 @@ impl<'a> Planner<'a> {
                 shadowed_by: None,
                 changed: false,
                 editable,
+                conflicted: action == Some(FileAction::Conflicted),
                 accepted,
             },
         );
         Ok(())
+    }
+
+    /// `note_conflict` notes the pack's file `file` where it still holds a
+    /// conflict that an earlier sync left, as the record of the pack that
+    /// owned it until this sync, `recorded` or `takeover`, reads one.
+    // sokf-implements: CLI-1_AC-47
+    fn note_conflict(
+        &mut self,
+        file: &Target,
+        recorded: Option<&LockedFile>,
+        takeover: Option<&Takeover>,
+    ) {
+        let left = match (recorded, takeover) {
+            (Some(f), _) => f.left_conflict().then(|| base_path(self.name, file.rel)),
+            (None, Some(t)) => t.conflicted.then(|| base_path(&t.from, &t.rel)),
+            (None, None) => return,
+        };
+        if file
+            .current
+            .bytes()
+            .is_some_and(|c| holds_conflict(self.root, &file.dest, c, left.as_ref()))
+        {
+            self.conflicted.push(file.dest.to_string());
+        }
     }
 
     /// `editable_acceptance` returns the acceptance `was` of the pack's file
@@ -321,7 +346,7 @@ impl<'a> Planner<'a> {
         match was {
             Some(a) if editable && (!a.deleted || stands) => {
                 self.out.notes.push(format!(
-                    "note: {dest} is an editable file of the pack {}, whose edit needs no acceptance, so the acceptance of its edit is dropped",
+                    "note: {dest} is an editable file of the pack {} and needs no acceptance; its acceptance is dropped",
                     self.name
                 ));
                 None
@@ -349,7 +374,7 @@ impl<'a> Planner<'a> {
             format!("{dest} is no longer an editable file of its pack")
         };
         self.out.notes.push(format!(
-            "note: {why}, so its edit now needs an acceptance; accept it with `pakf accept` if the project keeps the edit"
+            "note: {why}, and its edit now needs an acceptance; accept it with `pakf accept` if the project keeps the edit"
         ));
     }
 
@@ -362,7 +387,9 @@ impl<'a> Planner<'a> {
     /// takes the pack's version as its base, as a deleted file's does,
     /// because a base copy of the pack holds only the pack's own version.
     // sokf-implements: CLI-2_AC-62
+    // sokf-implements: CLI-2_AC-84
     fn kept_base(
+        &self,
         file: &Target,
         recorded: Option<&LockedFile>,
         takeover: Option<&Takeover>,
@@ -370,9 +397,11 @@ impl<'a> Planner<'a> {
         if takeover.is_some() {
             return None;
         }
-        let upstream = hash_of(file.upstream);
         recorded
-            .filter(|f| f.base != upstream || bit_changed(file, f.executable))
+            .filter(|f| {
+                self.changes(&f.base, self.name, file.rel, &file.dest, file.upstream)
+                    || bit_changed(file, f.executable)
+            })
             .map(|f| (f.base.clone(), f.executable))
     }
 
@@ -436,19 +465,26 @@ impl<'a> Planner<'a> {
             Dest::File(b) => Some(b),
         };
         Ok(match (recorded, current) {
+            // A change of owner reads the four cases against the old owner's
+            // base copy.
             // sokf-implements: CLI-2_AC-42
             (_, Some(cur)) if let Some(t) = takeover => {
-                if is_base(cur, &t.base) {
+                if self.holds_old(&t.base, &t.from, &t.rel, cur) {
+                    return Ok(self.update_unedited(dest, cur, upstream));
+                }
+                let edited = self.edited(&t.base, &t.from, &t.rel, dest, cur);
+                let changes = self.changes(&t.base, &t.from, &t.rel, dest, upstream);
+                if !edited && changes {
                     self.update_unedited(dest, cur, upstream)
-                } else if hash_of(upstream) == t.base || same_text(cur, upstream) {
-                    // A file that moves unchanged keeps its edit, as a merge
-                    // would, with no write.
+                } else if !changes || self.means(dest, cur, upstream) {
+                    // A file that moves unchanged, or only re-laid, keeps
+                    // its edit, as a merge would, with no write.
                     None
                 } else {
                     let base_copy = base_path(&t.from, &t.rel);
                     let base = fs::read(base_copy.to_fs(self.root)).map_err(|_| {
                         self.fail(format_args!(
-                            "{dest}: the base copy {base_copy} of the pack {} is missing, so the sync can't merge this pack's version into the edited file; restore the base copy from git",
+                            "{dest}: the base copy {base_copy} of the pack {} is missing; restore the base copy from git",
                             t.from
                         ))
                     })?;
@@ -475,9 +511,10 @@ impl<'a> Planner<'a> {
                 Some(FileAction::Added)
             }
             // A file that already holds the pack's version, such as the
-            // copy that `pakf patch` sent to the pack, is no edit.
+            // copy that `pakf patch` sent to the pack, or that means it in
+            // the project's layout, is no edit.
             (None, Some(cur)) => {
-                let same = same_text(cur, upstream)
+                let same = self.means(dest, cur, upstream)
                     && (!carries_mode(rel)
                         || file_is_executable(&dest.to_fs(self.root)) == file.executable);
                 if !same && !self.request.keep_existing {
@@ -485,21 +522,33 @@ impl<'a> Planner<'a> {
                 }
                 (!same).then_some(FileAction::KeptExisting)
             }
-            // A file and the pack's version that differ only in their line
-            // endings hold the same text (the decision "The committed bytes"
-            // of design-pack).
-            (Some(f), Some(cur)) if is_base(cur, &f.base) => {
-                self.update_unedited(dest, cur, upstream)
-            }
+            // The four cases of a sync: the copy against its base, and the
+            // pack's new version against it (the decision "The four cases of
+            // a sync" of design-pack). A file and the pack's version that
+            // differ only in their line endings hold the same text (the
+            // decision "The committed bytes" of design-pack).
+            // sokf-implements: CLI-2_AC-84
+            // sokf-implements: CLI-2_AC-85
+            // sokf-implements: CLI-2_AC-86
             (Some(f), Some(cur)) => {
-                if hash_of(upstream) == f.base || same_text(cur, upstream) {
+                // A copy that holds its old base takes the pack's new bytes,
+                // also where they only re-lay it, so that it holds its base
+                // on every machine, before any comparison parses a text.
+                if self.holds_old(&f.base, name, rel, cur) {
+                    return Ok(self.update_unedited(dest, cur, upstream));
+                }
+                let edited = self.edited(&f.base, name, rel, dest, cur);
+                let changes = self.changes(&f.base, name, rel, dest, upstream);
+                if !edited && changes {
+                    self.update_unedited(dest, cur, upstream)
+                } else if !changes || self.means(dest, cur, upstream) {
                     None
                 } else {
                     // sokf-implements: CLI-2_AC-19
                     let base_copy = base_path(name, rel);
                     let base = fs::read(base_copy.to_fs(self.root)).map_err(|_| {
                         self.fail(format_args!(
-                            "{dest}: the base copy {base_copy} is missing, so the sync can't merge the pack's change into the edited file; restore the base copy from git, or run `pakf remove {name}` and then `pakf add` with --keep-existing, which records the edited file as an edit of the pack's version"
+                            "{dest}: the base copy {base_copy} is missing; restore it from git, or run `pakf remove {name}` and then `pakf add --keep-existing`, which records the file as an edit of the pack's new version"
                         ))
                     })?;
                     Some(self.merge_into(rel, dest, cur, &base, upstream, false)?)
@@ -523,14 +572,14 @@ impl<'a> Planner<'a> {
         recorded: Option<&LockedFile>,
         takeover: Option<&Takeover>,
     ) -> Option<FileAction> {
-        let upstream = hash_of(file.upstream);
+        let (dest, upstream) = (&file.dest, file.upstream);
         match (takeover, recorded) {
-            (Some(t), _) => {
-                (t.base != upstream || bit_changed(file, t.executable)).then_some(FileAction::Kept)
-            }
-            (None, Some(f)) => {
-                (f.base != upstream || bit_changed(file, f.executable)).then_some(FileAction::Kept)
-            }
+            (Some(t), _) => (self.changes(&t.base, &t.from, &t.rel, dest, upstream)
+                || bit_changed(file, t.executable))
+            .then_some(FileAction::Kept),
+            (None, Some(f)) => (self.changes(&f.base, self.name, file.rel, dest, upstream)
+                || bit_changed(file, f.executable))
+            .then_some(FileAction::Kept),
             (None, None) => {
                 if !self.request.keep_existing {
                     self.unrecorded.push(file.dest.to_string());
@@ -589,7 +638,7 @@ impl<'a> Planner<'a> {
             self.out.reasons.insert(
                 dest.clone(),
                 format!(
-                    "{changed}, which sync never merges; copy {} over it to take the pack's version",
+                    "{changed}; copy {} over it to take the pack's version",
                     base_path(self.name, rel)
                 ),
             );
@@ -644,7 +693,7 @@ impl<'a> Planner<'a> {
                         && !self.carried.contains(rel)
                     {
                         self.out.notes.push(format!(
-                            "note: the paths of the entry move {} to {}, so the acceptance of its edit is dropped; accept the file again at its new path if the project keeps the edit",
+                            "note: the paths of the entry move {} to {}, and the acceptance of its edit is dropped; accept the file again at its new path if the project keeps the edit",
                             f.path,
                             now.unwrap_or_default()
                         ));
@@ -652,80 +701,24 @@ impl<'a> Planner<'a> {
                 }
                 Held::Dropped => self.out.deletes.push(base_path(self.name, rel)),
             }
-            if let Some((dest, action)) = dropped(self.root, rel, f, &self.request.owned_dests) {
+            if let Some((dest, action)) = super::dropped::dropped(
+                self.root,
+                self.meaning,
+                self.name,
+                rel,
+                f,
+                &self.request.owned_dests,
+            ) {
                 if action == FileAction::Removed {
                     self.out.deletes.push(dest.clone());
+                } else if f.still_conflicted(self.root, self.name, rel) {
+                    // sokf-implements: CLI-1_AC-48
+                    self.out.still_conflicted.push(dest.clone());
                 }
                 self.out.actions.push((dest, action));
             }
         }
     }
-}
-
-/// `dropping` returns the destination of each file that `existing`, the
-/// lock's entry of the pack `fetched`, records, that the pack no longer
-/// holds at that destination, and that its sync deletes, as
-/// `remove_dropped` and `dropped` say, so that the plan of every pack reads
-/// it as deleted before the sync writes.
-pub fn dropping(
-    root: &RepoRoot,
-    existing: Option<&LockedPack>,
-    fetched: &Fetched,
-    owned_dests: &BTreeSet<RepoPath>,
-) -> BTreeSet<RepoPath> {
-    let name = &fetched.pack.manifest.name;
-    existing
-        .into_iter()
-        .flat_map(|e| &e.files)
-        .filter(|(rel, f)| {
-            matches!(
-                held(root, name, fetched, rel, f),
-                Held::Moved | Held::Dropped
-            )
-        })
-        .filter_map(|(rel, f)| dropped(root, rel, f, owned_dests))
-        .filter(|(_, action)| *action == FileAction::Removed)
-        .map(|(dest, _)| dest)
-        .collect()
-}
-
-/// `dropped` returns what a sync does to the file `rel` that `f` records,
-/// which its pack no longer holds: it removes the file where it holds its
-/// base, as `LockedFile::holds_base` says, its executable bit among it, and
-/// keeps it otherwise, as the removal of a pack does.
-/// It returns none, and the sync reports nothing of the file, when the file
-/// is absent, when its destination is one of `owned_dests`, which a
-/// declared pack owns, because the file then passes to that pack, whose
-/// plan decides it, and when another pack shadowed the pack's version, as
-/// `stays_for_owner` says and the removal of a pack does too.
-// sokf-implements: CLI-2_AC-50
-// sokf-implements: CLI-2_AC-51
-// sokf-implements: CLI-2_AC-53
-// sokf-implements: CLI-2_AC-54
-// sokf-implements: CLI-2_AC-67
-fn dropped(
-    root: &RepoRoot,
-    rel: &str,
-    f: &LockedFile,
-    owned_dests: &BTreeSet<RepoPath>,
-) -> Option<(RepoPath, FileAction)> {
-    let dest = RepoPath::parse(&f.path)?;
-    if super::stays_for_owner(f, &dest, owned_dests) {
-        return None;
-    }
-    // An entry that isn't a readable regular file is an edit, so it stays.
-    // sokf-implements: CLI-2_AC-58
-    let path = dest.to_fs(root);
-    let cur = read_dest(&path);
-    if cur == Dest::Absent {
-        return None;
-    }
-    let action = if f.holds_base(&cur, mode::carried_bit(rel, &cur, &path)) {
-        FileAction::Removed
-    } else {
-        FileAction::Kept
-    };
-    Some((dest, action))
 }
 
 /// `again` returns the end of the note of an acceptance that a change of
@@ -734,7 +727,7 @@ fn dropped(
 /// accept the file again.
 fn again(editable: bool) -> &'static str {
     if editable {
-        "the pack declares the file editable, whose edit needs no acceptance"
+        "the file is editable and needs no acceptance"
     } else {
         "accept it again if the project keeps the edit"
     }

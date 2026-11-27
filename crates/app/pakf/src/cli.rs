@@ -17,10 +17,13 @@ use pakf_core::Output;
 // The `version` attribute puts the version in `--help`. The built-in `-V`
 // flag is disabled because `main::run` prints the version itself. The
 // built-in `-h` flag is disabled so that `help` below can describe `--help`
-// in a full sentence.
+// in a full sentence. The `about` text is the crate's description without
+// its last sentence, the mark of an unstable crate, which crates.io shows but
+// the help leaves out. A test of the help checks that the two texts still
+// agree.
 #[command(
     name = "pakf",
-    about,
+    about = "pakf shares project files through packs.",
     long_about = None,
     version,
     disable_version_flag = true,

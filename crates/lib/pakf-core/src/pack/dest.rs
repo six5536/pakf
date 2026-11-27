@@ -4,11 +4,16 @@
 //! read of a copy of a pack's `instructions.md` read a destination by one
 //! rule (the decision "One reading of a destination" of design-pack).
 //! It also finds the entry above a destination that stands in the way of a
-//! write.
+//! write, and the symbolic link on the way to a path that leads out of the
+//! repository.
 
-use std::{fs, io, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    path::Path,
+};
 
-use crate::{RepoPath, RepoRoot};
+use crate::{Error, RepoPath, RepoRoot, Result};
 
 /// A `Dest` is what stands at the destination of a file of a pack.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,13 +66,27 @@ fn absence(e: &io::Error) -> bool {
     )
 }
 
-/// `read_dest` reads what stands at `path`. It reads the bytes of a regular
-/// file only, and follows no symbolic link at the path, so that a FIFO
-/// blocks no command and a link reads as an edit whatever it points at.
+/// `read_dest` reads what stands at the repository file `path`. It reads
+/// the bytes of a regular file only, and follows no symbolic link at the
+/// path, so that a FIFO blocks no command and a link reads as an edit
+/// whatever it points at. A path below a link that leads out of the
+/// repository, as `link_out` finds it, reads as an entry that isn't a
+/// readable regular file, whatever stands at its target, so that no command
+/// reads a file of the machine through it.
 // sokf-implements: CLI-2_AC-57
 // sokf-implements: CLI-2_AC-58
 // sokf-implements: CLI-2_AC-59
-pub fn read_dest(path: &Path) -> Dest {
+// sokf-implements: CLI-1_AC-46
+pub fn read_dest(root: &RepoRoot, path: &RepoPath) -> Dest {
+    if let Some(out) = link_out(root, path, false) {
+        return Dest::Unreadable(out.why(path));
+    }
+    read_entry(&path.to_fs(root))
+}
+
+/// `read_entry` reads what stands at `path` on disk, as `read_dest` says,
+/// without a look at the links above it.
+fn read_entry(path: &Path) -> Dest {
     let kind = match fs::symlink_metadata(path) {
         Ok(meta) => meta.file_type(),
         Err(e) if absence(&e) => return Dest::Absent,
@@ -123,6 +142,157 @@ pub fn entry_above(
         }
     }
     None
+}
+
+/// `Leads` says where a symbolic link that leads out of the repository
+/// leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Leads {
+    /// Outside the repository root.
+    Outside,
+    /// Into a directory `.git`, among git's own files.
+    Git,
+    /// To no entry.
+    Nowhere,
+}
+
+/// A `LinkOut` is a symbolic link on the way to a path that leads out of the
+/// repository.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LinkOut {
+    /// The link, from the repository root.
+    pub(crate) link: RepoPath,
+    /// Where it leads.
+    pub(crate) leads: Leads,
+}
+
+impl LinkOut {
+    /// `to` says where the link leads.
+    fn to(&self) -> &'static str {
+        match self.leads {
+            Leads::Outside => "leads outside the repository",
+            Leads::Git => "leads into git's own files",
+            Leads::Nowhere => "leads to no file",
+        }
+    }
+
+    /// `shown` names the link, for a file at `path` or below it, and where it
+    /// leads, as a message prints it after a verb such as "through".
+    fn shown(&self, path: &RepoPath) -> String {
+        if self.link == *path {
+            format!("a symbolic link that {}", self.to())
+        } else {
+            format!("the symbolic link {}, which {}", self.link, self.to())
+        }
+    }
+
+    /// `why` says why the file `path`, at the link or below it, can't be
+    /// read.
+    pub(crate) fn why(&self, path: &RepoPath) -> String {
+        if self.link == *path {
+            format!("it is {}", self.shown(path))
+        } else {
+            format!("it lies below {}", self.shown(path))
+        }
+    }
+}
+
+/// `link_out` returns the first symbolic link on the way to `path`, at a
+/// directory above it or, where `at_path` says, at `path` itself, whose
+/// canonical target lies outside the canonical repository root or in a
+/// directory `.git`, or, at `path` itself, that leads to no entry, because
+/// a write follows a link at its path and creates a missing target. It
+/// returns none where no such link stands on the way, and stops at an entry
+/// that is absent or isn't a directory, below which nothing stands. A link
+/// whose target lies elsewhere in the root counts as the directory that it
+/// leads to. It reads the disk and not git, so a link that no commit holds
+/// counts too.
+// sokf-implements: CLI-2_AC-89
+// sokf-implements: CLI-2_AC-90
+pub(crate) fn link_out(root: &RepoRoot, path: &RepoPath, at_path: bool) -> Option<LinkOut> {
+    let mut way: Vec<RepoPath> = std::iter::successors(path.parent(), RepoPath::parent)
+        .take_while(|d| *d != RepoPath::root())
+        .collect();
+    way.reverse();
+    if at_path && *path != RepoPath::root() {
+        way.push(path.clone());
+    }
+    let mut base = None;
+    for at in way {
+        let fs_at = at.to_fs(root);
+        let meta = fs::symlink_metadata(&fs_at).ok()?;
+        if !meta.file_type().is_symlink() {
+            if meta.is_dir() {
+                continue;
+            }
+            return None;
+        }
+        // Both paths take one form, the verbatim one on Windows, so that a
+        // long path compares with a short one.
+        let base = base.get_or_insert_with(|| {
+            fs::canonicalize(root.as_path()).unwrap_or_else(|_| root.as_path().to_path_buf())
+        });
+        let leads = match fs::canonicalize(&fs_at) {
+            // A link above the path that leads to nothing stands in the
+            // way, as `entry_above` says, so nothing is written below it.
+            Err(_) if at != *path => return None,
+            Err(_) => Leads::Nowhere,
+            Ok(target) => match target.strip_prefix(&*base) {
+                Err(_) => Leads::Outside,
+                Ok(rest)
+                    if rest
+                        .components()
+                        .any(|c| c.as_os_str().eq_ignore_ascii_case(".git")) =>
+                {
+                    Leads::Git
+                }
+                Ok(_) => continue,
+            },
+        };
+        return Some(LinkOut { link: at, leads });
+    }
+    None
+}
+
+/// `refuse_links_out` refuses the repository files `paths`, each with
+/// whether its own path counts, as `link_out` says, where a link that leads
+/// out of the repository stands on the way to one, and names each such
+/// file with its link, the files of one link together, before the command
+/// writes any file.
+// sokf-implements: CLI-2_AC-89
+// sokf-implements: CLI-2_AC-90
+pub(crate) fn refuse_links_out(
+    root: &RepoRoot,
+    paths: impl IntoIterator<Item = (RepoPath, bool)>,
+) -> Result<()> {
+    let mut links: BTreeMap<LinkOut, BTreeSet<RepoPath>> = BTreeMap::new();
+    for (path, at_path) in paths {
+        if let Some(out) = link_out(root, &path, at_path) {
+            links.entry(out).or_default().insert(path);
+        }
+    }
+    let action = match links.len() {
+        0 => return Ok(()),
+        1 => "move the link away",
+        _ => "move each link away",
+    };
+    let lines: Vec<String> = links
+        .iter()
+        .map(|(out, files)| {
+            let named: Vec<&str> = files.iter().map(RepoPath::as_str).collect();
+            // A link at the path of the one file is named by that file.
+            let shown = match named[..] {
+                [_] => files.iter().next().map(|f| out.shown(f)),
+                _ => None,
+            }
+            .unwrap_or_else(|| out.shown(&RepoPath::root()));
+            format!("{}: pakf doesn't write through {shown}", named.join(", "))
+        })
+        .collect();
+    Err(Error::Pack(format!(
+        "{}; {action}, then run the command again",
+        lines.join("; ")
+    )))
 }
 
 /// `empties` returns whether a directory, and no link, stands at `path`
@@ -229,20 +399,25 @@ mod tests {
     #[test]
     fn a_path_reads_by_what_stands_at_it() {
         let dir = super::super::TempDir::new().unwrap();
+        let root = RepoRoot::new(dir.path().to_path_buf());
+        let at = |s: &str| RepoPath::parse(s).unwrap();
         let file = dir.path().join("file");
         fs::write(&file, "text\n").unwrap();
-        assert_eq!(read_dest(&file), Dest::File(b"text\n".to_vec()));
+        assert_eq!(
+            read_dest(&root, &at("/file")),
+            Dest::File(b"text\n".to_vec())
+        );
         assert!(!is_absent(&file));
         let missing = dir.path().join("missing");
-        assert_eq!(read_dest(&missing), Dest::Absent);
+        assert_eq!(read_dest(&root, &at("/missing")), Dest::Absent);
         assert!(is_absent(&missing));
         // A file at a directory above the path stands for no entry at it.
         let below = file.join("below");
-        assert_eq!(read_dest(&below), Dest::Absent);
+        assert_eq!(read_dest(&root, &at("/file/below")), Dest::Absent);
         assert!(is_absent(&below));
         let sub = dir.path().join("sub");
         fs::create_dir(&sub).unwrap();
-        assert!(matches!(read_dest(&sub), Dest::Unreadable(_)));
+        assert!(matches!(read_dest(&root, &at("/sub")), Dest::Unreadable(_)));
         assert!(!is_absent(&sub));
     }
 
@@ -251,6 +426,7 @@ mod tests {
     fn a_link_reads_as_unreadable_whatever_it_points_at() {
         use std::os::unix::fs::symlink;
         let dir = super::super::TempDir::new().unwrap();
+        let root = RepoRoot::new(dir.path().to_path_buf());
         let file = dir.path().join("file");
         fs::write(&file, "text\n").unwrap();
         for (name, target) in [
@@ -259,8 +435,105 @@ mod tests {
         ] {
             let link = dir.path().join(name);
             symlink(target, &link).unwrap();
-            assert!(matches!(read_dest(&link), Dest::Unreadable(_)), "{name}");
+            let at = RepoPath::parse(&format!("/{name}")).unwrap();
+            assert!(
+                matches!(read_dest(&root, &at), Dest::Unreadable(_)),
+                "{name}"
+            );
             assert!(!is_absent(&link), "{name}");
         }
+    }
+
+    /// `linked` returns a repository root with a directory `real`, a file
+    /// `file`, a `.git` directory, and a directory outside the root, and
+    /// keeps both alive.
+    #[cfg(unix)]
+    fn linked() -> (super::super::TempDir, super::super::TempDir, RepoRoot) {
+        let dir = super::super::TempDir::new().unwrap();
+        let outside = super::super::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("real/sub")).unwrap();
+        fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        fs::write(dir.path().join("file"), "x").unwrap();
+        fs::write(outside.path().join("secret"), "s").unwrap();
+        let root = RepoRoot::new(dir.path().to_path_buf());
+        (dir, outside, root)
+    }
+
+    // sokf-tests: CLI-2_AC-89
+    // sokf-tests: CLI-2_AC-90
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_is_found_on_the_way_to_a_path() {
+        use std::os::unix::fs::symlink;
+        let (dir, outside, root) = linked();
+        let at = |s: &str| RepoPath::parse(s).unwrap();
+        let d = dir.path();
+        symlink(outside.path(), d.join("out")).unwrap();
+        symlink("real", d.join("in")).unwrap();
+        symlink("out", d.join("chain")).unwrap();
+        symlink("real/../..", d.join("up")).unwrap();
+        symlink(".git/hooks", d.join("hooks")).unwrap();
+        symlink("in/sub", d.join("deep")).unwrap();
+        symlink(outside.path().join("secret"), d.join("secret")).unwrap();
+        symlink(outside.path().join("none"), d.join("none")).unwrap();
+        symlink("nowhere", d.join("dangling")).unwrap();
+        symlink(outside.path(), d.join("real/sub/out")).unwrap();
+        let found = |p: &str, at_path: bool| {
+            link_out(&root, &at(p), at_path).map(|o| (o.link.as_str().to_string(), o.leads))
+        };
+        let out = |l: &str, leads| Some((l.to_string(), leads));
+        assert_eq!(found("/out/x", false), out("/out", Leads::Outside));
+        assert_eq!(found("/out/a/b/x", false), out("/out", Leads::Outside));
+        assert_eq!(found("/chain/x", false), out("/chain", Leads::Outside));
+        assert_eq!(found("/up/x", false), out("/up", Leads::Outside));
+        assert_eq!(found("/hooks/x", false), out("/hooks", Leads::Git));
+        // A link inside the root counts as its directory, also on the way
+        // to a link out below it.
+        assert_eq!(found("/in/x", false), None);
+        assert_eq!(found("/deep/x", false), None);
+        assert_eq!(
+            found("/in/sub/out/x", false),
+            out("/in/sub/out", Leads::Outside)
+        );
+        // A link at the path itself counts only where the write follows it.
+        assert_eq!(found("/secret", false), None);
+        assert_eq!(found("/secret", true), out("/secret", Leads::Outside));
+        assert_eq!(found("/none", true), out("/none", Leads::Nowhere));
+        assert_eq!(found("/dangling", true), out("/dangling", Leads::Nowhere));
+        // A dangling link above the path, or a file there, stands in the
+        // way, and nothing is written below it.
+        assert_eq!(found("/dangling/x", false), None);
+        assert_eq!(found("/file/x", true), None);
+        assert_eq!(found("/real/sub/x", true), None);
+        assert_eq!(found("/missing/x", true), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_below_a_link_out_reads_as_unreadable() {
+        use std::os::unix::fs::symlink;
+        let (dir, outside, root) = linked();
+        symlink(outside.path(), dir.path().join("out")).unwrap();
+        let dest = RepoPath::parse("/out/secret").unwrap();
+        assert_eq!(
+            read_dest(&root, &dest),
+            Dest::Unreadable(
+                "it lies below the symbolic link /out, which leads outside the repository".into()
+            )
+        );
+        let err = refuse_links_out(
+            &root,
+            [
+                (dest.clone(), false),
+                (RepoPath::parse("/out/other").unwrap(), false),
+                (RepoPath::parse("/real/x").unwrap(), false),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "pack: /out/other, /out/secret: pakf doesn't write through the symbolic link /out, which leads outside the repository; move the link away, then run the command again"
+        );
+        assert!(refuse_links_out(&root, [(RepoPath::parse("/real/x").unwrap(), true)]).is_ok());
     }
 }

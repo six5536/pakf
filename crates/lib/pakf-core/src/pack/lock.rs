@@ -1,13 +1,14 @@
 //! This module reads and writes `/.pakf/lock.toml`, the record of each
 //! schema pack that `pakf sync` copied into the repository.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
 use super::{
-    dest::Dest,
-    eol::{is_base, normalise},
+    dest::{Dest, read_dest},
+    eol::is_base,
+    meaning::Meaning,
 };
 use crate::{Error, RepoPath, RepoRoot, Result, source::read_optional};
 
@@ -15,10 +16,13 @@ use crate::{Error, RepoPath, RepoRoot, Result, source::read_optional};
 const HEADER: &str = "# pakf sync writes this file. Do not edit it.\n";
 
 /// `LOCK_VERSION` is the version of the lock's format that this tool reads
-/// and writes. A lock without `lock-version` has the version 1, and the
-/// version 2 adds `editable` to the record of a file, so this tool reads a
-/// lock of either version.
-pub const LOCK_VERSION: u32 = 2;
+/// and writes. A lock without `lock-version` has the version 1, the version
+/// 2 adds `editable` to the record of a file, and the version 3 records the
+/// values of `same-same` in place of pakf's own `fnv1a64:` hashes. This
+/// tool reads a lock of each version alike, where an `fnv1a64:` value of an
+/// older lock equals no value that it computes (the decision "Fingerprints
+/// in the lock" of design-pack).
+pub const LOCK_VERSION: u32 = 3;
 
 /// `lock_path` returns the path of the lock.
 pub fn lock_path() -> RepoPath {
@@ -134,8 +138,9 @@ pub struct LockedPack {
 pub struct LockedFile {
     /// The file's path in the repository.
     pub path: String,
-    /// The hash of the file's base: the pack's version of the file at the
-    /// last sync, as `fnv1a64:<HEX>`.
+    /// The plain hash that `same-same` gives of the file's base, the pack's
+    /// version of the file at the last sync, in its text form
+    /// `ss1:bytes:<HEX>`.
     pub base: String,
     /// Whether the pack's version of a file of `files/` is executable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -155,6 +160,10 @@ pub struct LockedFile {
     /// no acceptance while the pack owns the file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub editable: bool,
+    /// Whether the last sync left a conflict in the file, so that the line
+    /// that opens it counts inside a fenced code block too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conflicted: bool,
     /// The edit or the deletion of the file that a maintainer accepted with
     /// `pakf accept`, so that `pakf status --check` passes on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,8 +176,10 @@ pub struct LockedFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Accepted {
-    /// The hash of the accepted version, with each CRLF of a text read as
-    /// LF, as `fnv1a64:<HEX>`, or none for an accepted deletion.
+    /// The fingerprint that `same-same` gives of the accepted version's
+    /// meaning, with each CRLF of a text read as LF, or its plain hash where
+    /// the library doesn't compare it by meaning, in the library's text
+    /// form, or none for an accepted deletion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     /// Whether the accepted version of a file of `files/` is executable.
@@ -183,52 +194,125 @@ pub struct Accepted {
 // sokf:end lock
 
 impl LockedFile {
+    /// `left_conflict` returns whether the last sync left a conflict in the
+    /// file, as the record says, or the record comes from a lock older than
+    /// the version 3, whose base is an `fnv1a64:` hash, because such a lock
+    /// records no conflict.
+    pub fn left_conflict(&self) -> bool {
+        self.conflicted || self.base.parse::<same_same::Fingerprint>().is_err()
+    }
+
+    /// `holds_conflict` returns whether `bytes`, the text of the file `rel`
+    /// of the pack `name`, whose record this is, hold a conflict, as the
+    /// lock module's free function `holds_conflict` reads one with the
+    /// record and the base copy.
+    pub fn holds_conflict(&self, root: &RepoRoot, name: &str, rel: &str, bytes: &[u8]) -> bool {
+        RepoPath::parse(&self.path).is_some_and(|dest| {
+            let left = self.left_conflict().then(|| base_path(name, rel));
+            holds_conflict(root, &dest, bytes, left.as_ref())
+        })
+    }
+
+    /// `still_conflicted` returns whether a regular file stands at the
+    /// file's path and holds a conflict, as `holds_conflict` reads one, so
+    /// that a command that drops the record and keeps the file can say so.
+    pub fn still_conflicted(&self, root: &RepoRoot, name: &str, rel: &str) -> bool {
+        RepoPath::parse(&self.path).is_some_and(|dest| match read_dest(root, &dest) {
+            Dest::File(bytes) => self.holds_conflict(root, name, rel, &bytes),
+            _ => false,
+        })
+    }
+
     /// `holds_base` returns whether what stands at the file's path, `dest`,
     /// holds the file's base: a regular file whose text is the base, with
-    /// each CRLF read as LF, and, for a file of `files/`, whose executable
-    /// bit `bit` is the bit that the record holds. `bit` is none for any
+    /// each CRLF read as LF, or means the same as the base copy at
+    /// `base_copy`, as `Meaning::unedited` reads it, and, for a file of
+    /// `files/`, whose executable bit `bit` is the bit that the record
+    /// holds. `bit` is none for any
     /// other file and on a platform without the bit, where no command
     /// compares it. An absent file and an entry that isn't a readable
     /// regular file hold no base. The test of an edit that `pakf status`,
     /// `pakf ls`, `pakf accept`, and `pakf remove` share, and sync's removal
     /// of a file that its pack no longer holds, ask this function, so that
-    /// they read the same file alike. Sync's update of a file that its pack
+    /// they read the same file alike with one comparison, which the `For` of
+    /// the command's `Meaning` picks: a command that writes reads by the
+    /// library's own reading alone, and one that reports through the rules'
+    /// formatters and commands too. Sync's update of a file that its pack
     /// still holds reads the text against the base apart from the bit, which
     /// its plan of the bit decides on its own.
     // sokf-implements: CLI-1_AC-22
     // sokf-implements: CLI-1_AC-25
-    pub fn holds_base(&self, dest: &Dest, bit: Option<bool>) -> bool {
-        matches!(dest, Dest::File(b) if is_base(b, &self.base))
-            && bit.is_none_or(|x| x == self.executable)
+    pub fn holds_base(
+        &self,
+        dest: &Dest,
+        bit: Option<bool>,
+        base_copy: &Path,
+        meaning: &Meaning,
+    ) -> bool {
+        let text = match dest {
+            Dest::File(b) => {
+                is_base(b, &self.base)
+                    || RepoPath::parse(&self.path)
+                        .is_some_and(|path| meaning.unedited(&path, b, base_copy))
+            }
+            _ => false,
+        };
+        text && bit.is_none_or(|x| x == self.executable)
     }
 }
 
 impl Accepted {
-    /// `of` returns the acceptance of a file that holds `bytes`, or of a
-    /// deleted file when `bytes` is none, with the executable bit `bit` of a
-    /// file of `files/`.
-    pub fn of(bytes: Option<&[u8]>, bit: bool, note: &str) -> Accepted {
+    /// `of` returns the acceptance of the file at `dest` that holds `bytes`,
+    /// or of a deleted file when `bytes` is none, with the executable bit
+    /// `bit` of a file of `files/`, and the fingerprint of the accepted
+    /// version that `meaning` gives.
+    pub fn of(
+        bytes: Option<&[u8]>,
+        bit: bool,
+        note: &str,
+        dest: &RepoPath,
+        meaning: &Meaning,
+    ) -> Accepted {
         Accepted {
-            hash: bytes.map(|b| hash_of(&normalise(b))),
+            hash: bytes.map(|b| meaning.fingerprint(dest, b)),
             executable: bytes.is_some() && bit,
             deleted: bytes.is_none(),
             note: note.to_string(),
         }
     }
 
-    /// `holds` returns whether what stands at the file's path, `dest`,
-    /// holds the accepted version: a regular file with the accepted text
-    /// and, for a file of `files/`, the accepted executable bit `bit`, which
+    /// `of_older_lock` returns whether the acceptance records a hash that
+    /// no fingerprint of `same-same` reads, such as an `fnv1a64:` hash that
+    /// pakf 0.2 recorded, which holds no version.
+    pub fn of_older_lock(&self) -> bool {
+        self.hash
+            .as_deref()
+            .is_some_and(|h| h.parse::<same_same::Fingerprint>().is_err())
+    }
+
+    /// `holds` returns whether what stands at the file's path `path`,
+    /// `dest`, holds the accepted version: a regular file that means what
+    /// the accepted fingerprint records, as `Meaning::holds_fingerprint`
+    /// reads it, and, for a file of `files/`, the accepted executable bit
+    /// `bit`, which
     /// is none for any other file, or no entry for an accepted deletion. An
     /// entry that isn't a readable regular file holds no version, so it
     /// holds neither an accepted edit nor an accepted deletion.
     // sokf-implements: CLI-1_AC-27
     // sokf-implements: CLI-4_AC-14
-    pub fn holds(&self, dest: &Dest, bit: Option<bool>) -> bool {
+    pub fn holds(
+        &self,
+        dest: &Dest,
+        bit: Option<bool>,
+        path: &RepoPath,
+        meaning: &Meaning,
+    ) -> bool {
         match (dest, &self.hash) {
             (Dest::Absent, _) => self.deleted,
             (Dest::Unreadable(_), _) | (Dest::File(_), None) => false,
-            (Dest::File(b), Some(h)) => is_base(b, h) && bit.is_none_or(|x| x == self.executable),
+            (Dest::File(b), Some(h)) => {
+                meaning.holds_fingerprint(path, b, h) && bit.is_none_or(|x| x == self.executable)
+            }
         }
     }
 }
@@ -261,9 +345,40 @@ impl Lock {
     }
 }
 
-/// `hash_of` returns the hash of `bytes` as the lock records it.
+/// `holds_conflict` returns whether `bytes`, the text of the file at
+/// `dest`, read with each invalid sequence replaced, hold a conflict, as
+/// `conflict_lines` reads one. Where a sync left a conflict in the file,
+/// `left` is the base copy that holds the pack's version, and an absent
+/// base copy holds no example. Every command that reports or refuses a
+/// conflict of a file of a pack asks this function, or
+/// `LockedFile::holds_conflict`, so that the commands agree; only the
+/// comparison by meaning, which has no record, reads the text itself.
+// sokf-implements: CLI-1_AC-47
+pub fn holds_conflict(
+    root: &RepoRoot,
+    dest: &RepoPath,
+    bytes: &[u8],
+    left: Option<&RepoPath>,
+) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    // The base copy is read only for a text that holds the opening line of
+    // pakf's merge, which no other text needs, and by the one reading of a
+    // destination, so that a copy below a link out of the repository holds
+    // no example on any machine.
+    let version = left
+        .filter(|_| text.lines().any(|l| crate::conflicts::is_opening(dest, l)))
+        .map(|copy| match read_dest(root, copy) {
+            Dest::File(b) => String::from_utf8_lossy(&b).into_owned(),
+            _ => String::new(),
+        });
+    !crate::conflicts::conflict_lines(dest, &text, version.as_deref()).is_empty()
+}
+
+/// `hash_of` returns the hash of `bytes` as the lock records it: the plain
+/// hash of `same-same`, in its text form, which keeps where each CRLF
+/// stood, so that two bytes that differ hash apart.
 pub fn hash_of(bytes: &[u8]) -> String {
-    format!("fnv1a64:{:016x}", crate::source::fnv1a64(bytes))
+    same_same::Fingerprint::of_bytes(bytes).to_string()
 }
 
 /// `read_lock` reads the lock, and returns an empty lock when the file is
@@ -323,6 +438,23 @@ pub fn lock_text(lock: &Lock) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// `meaning` returns a comparison without a configuration, detection,
+    /// or a cache on disk.
+    fn meaning() -> Meaning {
+        Meaning::in_memory(
+            Path::new("."),
+            crate::config::Compare {
+                detect: false,
+                rules: Vec::new(),
+            },
+            crate::pack::For::Reports,
+        )
+    }
+
+    fn at() -> RepoPath {
+        RepoPath::parse("/a.txt").unwrap()
+    }
+
     #[test]
     fn a_lock_round_trips_through_its_text() {
         let mut lock = Lock::default();
@@ -345,6 +477,7 @@ mod tests {
                 shadowed_by: None,
                 changed: false,
                 editable: false,
+                conflicted: false,
                 accepted: None,
             },
         );
@@ -357,14 +490,21 @@ mod tests {
                 shadowed_by: None,
                 changed: false,
                 editable: true,
-                accepted: Some(Accepted::of(Some(b"y\nz\n"), false, "the project's binary")),
+                conflicted: false,
+                accepted: Some(Accepted::of(
+                    Some(b"y\nz\n"),
+                    false,
+                    "the project's binary",
+                    &at(),
+                    &meaning(),
+                )),
             },
         );
         lock.packs.insert("@acme/method".into(), pack);
         let text = lock_text(&lock).unwrap();
         assert!(text.starts_with(HEADER), "{text}");
         assert!(text.contains("[packs.\"@acme/method\"]"), "{text}");
-        assert!(text.contains("lock-version = 2\n"), "{text}");
+        assert!(text.contains("lock-version = 3\n"), "{text}");
         assert!(text.contains("editable = true\n"), "{text}");
         assert!(text.contains("note = \"the project's binary\""), "{text}");
         assert!(!text.contains("deleted"), "{text}");
@@ -385,23 +525,31 @@ mod tests {
     // sokf-tests: CLI-4_AC-14
     #[test]
     fn a_file_holds_its_accepted_version_with_either_line_ending() {
-        let a = Accepted::of(Some(b"a\nb\n"), true, "why");
-        assert!(a.holds(&file(b"a\nb\n"), Some(true)));
-        assert!(a.holds(&file(b"a\r\nb\r\n"), Some(true)));
-        assert!(a.holds(&file(b"a\nb\n"), None));
-        assert!(!a.holds(&file(b"a\nb\n"), Some(false)));
-        assert!(!a.holds(&file(b"a\nc\n"), Some(true)));
-        assert!(!a.holds(&Dest::Absent, None));
-        let crlf = Accepted::of(Some(b"a\r\nb\r\n"), false, "why");
-        assert!(crlf.holds(&file(b"a\nb\n"), None));
-        let gone = Accepted::of(None, true, "unused");
+        let (m, at) = (meaning(), at());
+        let holds = |a: &Accepted, d: &Dest, bit| a.holds(d, bit, &at, &m);
+        let a = Accepted::of(Some(b"a\nb\n"), true, "why", &at, &m);
+        assert!(holds(&a, &file(b"a\nb\n"), Some(true)));
+        assert!(holds(&a, &file(b"a\r\nb\r\n"), Some(true)));
+        assert!(holds(&a, &file(b"a\nb\n"), None));
+        assert!(!holds(&a, &file(b"a\nb\n"), Some(false)));
+        assert!(!holds(&a, &file(b"a\nc\n"), Some(true)));
+        assert!(!holds(&a, &Dest::Absent, None));
+        let crlf = Accepted::of(Some(b"a\r\nb\r\n"), false, "why", &at, &m);
+        assert!(holds(&crlf, &file(b"a\nb\n"), None));
+        let gone = Accepted::of(None, true, "unused", &at, &m);
         assert!(gone.deleted && !gone.executable && gone.hash.is_none());
-        assert!(gone.holds(&Dest::Absent, None));
-        assert!(!gone.holds(&file(b""), None));
+        assert!(holds(&gone, &Dest::Absent, None));
+        assert!(!holds(&gone, &file(b""), None));
         // An entry that isn't a readable regular file holds neither.
         let unreadable = Dest::Unreadable("a directory stands at its path".into());
-        assert!(!a.holds(&unreadable, None));
-        assert!(!gone.holds(&unreadable, None));
+        assert!(!holds(&a, &unreadable, None));
+        assert!(!holds(&gone, &unreadable, None));
+        // An acceptance of an older lock holds no version.
+        let old = Accepted {
+            hash: Some("fnv1a64:a8c7f832281a39c5".into()),
+            ..a
+        };
+        assert!(!holds(&old, &file(b"a\nb\n"), Some(true)));
     }
 
     // sokf-tests: CLI-1_AC-22
@@ -415,22 +563,37 @@ mod tests {
             shadowed_by: None,
             changed: false,
             editable: false,
+            conflicted: false,
             accepted: None,
         };
         let (plain, script) = (record(false), record(true));
-        assert!(plain.holds_base(&file(b"a\nb\n"), Some(false)));
-        assert!(plain.holds_base(&file(b"a\r\nb\r\n"), Some(false)));
-        assert!(script.holds_base(&file(b"a\nb\n"), Some(true)));
+        let m = meaning();
+        let none = Path::new("/nonexistent/base");
+        let holds = |f: &LockedFile, d: &Dest, bit| f.holds_base(d, bit, none, &m);
+        assert!(holds(&plain, &file(b"a\nb\n"), Some(false)));
+        assert!(holds(&plain, &file(b"a\r\nb\r\n"), Some(false)));
+        assert!(holds(&script, &file(b"a\nb\n"), Some(true)));
         // A file that carries no bit holds its base by its text alone.
-        assert!(plain.holds_base(&file(b"a\nb\n"), None));
-        assert!(script.holds_base(&file(b"a\nb\n"), None));
+        assert!(holds(&plain, &file(b"a\nb\n"), None));
+        assert!(holds(&script, &file(b"a\nb\n"), None));
         // A change of the bit, either way, is an edit.
-        assert!(!plain.holds_base(&file(b"a\nb\n"), Some(true)));
-        assert!(!script.holds_base(&file(b"a\nb\n"), Some(false)));
-        assert!(!plain.holds_base(&file(b"a\nc\n"), Some(false)));
-        assert!(!plain.holds_base(&Dest::Absent, None));
+        assert!(!holds(&plain, &file(b"a\nb\n"), Some(true)));
+        assert!(!holds(&script, &file(b"a\nb\n"), Some(false)));
+        assert!(!holds(&plain, &file(b"a\nc\n"), Some(false)));
+        assert!(!holds(&plain, &Dest::Absent, None));
         let unreadable = Dest::Unreadable("a directory stands at its path".into());
-        assert!(!plain.holds_base(&unreadable, None));
+        assert!(!holds(&plain, &unreadable, None));
+        // A base of an older lock holds no text, and the base copy settles
+        // it.
+        let old = LockedFile {
+            base: "fnv1a64:a8c7f832281a39c5".into(),
+            ..record(false)
+        };
+        assert!(!holds(&old, &file(b"a\nb\n"), None));
+        let dir = crate::test_support::fresh_dir("lock-old-base");
+        std::fs::write(dir.join("base"), b"a\nb\n").unwrap();
+        assert!(old.holds_base(&file(b"a\r\nb\r\n"), None, &dir.join("base"), &m));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `file` returns a regular file that holds `bytes`.
@@ -452,15 +615,28 @@ mod tests {
         let lock = read_lock(&root).unwrap();
         assert!(lock.packs.contains_key("@acme/p"));
         // A lock of the version 1, which pakf 0.1 wrote, reads, and is
-        // written again as the version 2.
-        assert!(lock_text(&lock).unwrap().contains("lock-version = 2\n"));
+        // written again as the version 3.
+        assert!(lock_text(&lock).unwrap().contains("lock-version = 3\n"));
         std::fs::write(
             dir.join(".pakf/lock.toml"),
             "lock-version = 1\n[packs.\"@acme/p\"]\nsource = \"x\"\ncommit = \"1\"\nversion = \"1\"\n",
         )
         .unwrap();
         assert!(read_lock(&root).unwrap().packs.contains_key("@acme/p"));
-        std::fs::write(dir.join(".pakf/lock.toml"), "lock-version = 3\n").unwrap();
+        // A lock of the version 2, which pakf 0.2 wrote, reads with its
+        // `fnv1a64:` values.
+        std::fs::write(
+            dir.join(".pakf/lock.toml"),
+            "lock-version = 2\n[packs.\"@acme/p\"]\nsource = \"x\"\ncommit = \"1\"\nversion = \"1\"\n[packs.\"@acme/p\".files.\"files/a\"]\npath = \"/a\"\nbase = \"fnv1a64:cbf29ce484222325\"\n[packs.\"@acme/p\".files.\"files/a\".accepted]\nhash = \"fnv1a64:cbf29ce484222325\"\nnote = \"n\"\n",
+        )
+        .unwrap();
+        let old = read_lock(&root).unwrap();
+        assert_eq!(
+            old.packs["@acme/p"].files["files/a"].base,
+            "fnv1a64:cbf29ce484222325"
+        );
+        assert!(lock_text(&old).unwrap().contains("lock-version = 3\n"));
+        std::fs::write(dir.join(".pakf/lock.toml"), "lock-version = 4\n").unwrap();
         let e = read_lock(&root).unwrap_err().to_string();
         assert!(e.contains("upgrade pakf"), "{e}");
         // A key that isn't an id is refused, a bare slug among them.
@@ -488,7 +664,8 @@ mod tests {
             instructions_of("@pakf/pakf").as_str(),
             "/.pakf/packs/@pakf/pakf/instructions.md"
         );
-        assert_eq!(hash_of(b""), "fnv1a64:cbf29ce484222325");
+        assert!(hash_of(b"").starts_with("ss1:bytes:"), "{}", hash_of(b""));
+        assert_ne!(hash_of(b"a\r\n"), hash_of(b"a\n"));
     }
 
     proptest::proptest! {
@@ -502,7 +679,7 @@ mod tests {
                     proptest::option::of("[a-z]{1,6}"),
                     proptest::collection::btree_map(
                         "files/[a-z]{1,6}",
-                        ("/[a-z]{1,6}", proptest::prelude::any::<bool>(), proptest::prelude::any::<bool>(), proptest::option::of("[ -~]{0,10}")),
+                        ("/[a-z]{1,6}", proptest::prelude::any::<bool>(), proptest::prelude::any::<bool>(), proptest::prelude::any::<bool>(), proptest::option::of("[ -~]{0,10}")),
                         0..4,
                     ),
                 ),
@@ -513,8 +690,8 @@ mod tests {
             for ((scope, name), (source, git_ref, files)) in packs {
                 let files = files
                     .into_iter()
-                    .map(|(rel, (path, executable, editable, note))| {
-                        let accepted = note.map(|n| Accepted::of(Some(b"x"), executable, &n));
+                    .map(|(rel, (path, executable, editable, conflicted, note))| {
+                        let accepted = note.map(|n| Accepted::of(Some(b"x"), executable, &n, &at(), &meaning()));
                         (rel, LockedFile {
                             path,
                             base: hash_of(b"base"),
@@ -522,6 +699,7 @@ mod tests {
                             shadowed_by: None,
                             changed: false,
                             editable,
+                            conflicted,
                             accepted,
                         })
                     })

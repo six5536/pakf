@@ -4,7 +4,9 @@
 // them at any time: `all` for every pack, or a list of pack ids that commas separate.
 // A task that skips the tests says so, and why. A pack that pakf records no base for,
 // as in a public mirror, runs its tests, because nothing then shows that its files are
-// the ones that the pack repository tested.
+// the ones that the pack repository tested. The edit of an editable file, which a pack
+// declares for a project to fill with its own content, runs none, while a conflict or a
+// deletion of one does.
 //
 // Usage: pack-tests.mts <pack id> <argument of node --test>...
 
@@ -15,7 +17,15 @@ type Env = Record<string, string | undefined>;
 
 export interface PackReport {
   name: string;
-  files: { path: string; state: string }[];
+  files: PackFile[];
+}
+
+// A file of a pack in the report, with its kind where pakf gives one: pakf 0.2.0 gives
+// each file a kind, such as `file` or `editable`, and pakf 0.1.1 none.
+export interface PackFile {
+  path: string;
+  state: string;
+  kind?: string;
 }
 
 export type PackTests = { run: true; note?: string } | { run: false; skipped: string };
@@ -31,12 +41,19 @@ export function isCode(path: string): boolean {
   return !path.startsWith("/knowledge/") && !path.endsWith(".md");
 }
 
+// The edit of an editable file is the project's own content, which goes back to no
+// pack, and the pack's tests read their own fixtures, so it runs none of them. A
+// conflict or a deletion of an editable file still diverges from the pack.
+export function isEditableEdit(file: PackFile): boolean {
+  return file.kind === "editable" && file.state === "edited";
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// The entries of `pakf status --json`, each with the name of its pack and the path and
-// the state of each file that differs from its base or has an acceptance.
+// The entries of `pakf status --json`, each with the name of its pack and the path, the
+// state, and the kind of each file that differs from its base or has an acceptance.
 export function parseReport(text: string): PackReport[] {
   const report: unknown = JSON.parse(text);
   if (!Array.isArray(report)) {
@@ -51,7 +68,13 @@ export function parseReport(text: string): PackReport[] {
       if (!isRecord(file) || typeof file.path !== "string" || typeof file.state !== "string") {
         throw new TypeError(`a file of ${name} has no path or no state`);
       }
-      return { path: file.path, state: file.state };
+      if (file.kind === undefined) {
+        return { path: file.path, state: file.state };
+      }
+      if (typeof file.kind !== "string") {
+        throw new TypeError(`the file ${file.path} of ${name} has a kind that isn't a string`);
+      }
+      return { path: file.path, state: file.state, kind: file.kind };
     });
     return { name, files };
   });
@@ -92,12 +115,15 @@ export function packTests(pack: string, report: PackReport[], env: Env): PackTes
       note: `${task}: runs the tests of ${pack}, because pakf records no base for the pack.`,
     };
   }
-  if (entry.files.some((file) => DIFFERS.has(file.state) && isCode(file.path))) {
+  const code = entry.files.filter((file) => DIFFERS.has(file.state) && isCode(file.path));
+  if (code.some((file) => !isEditableEdit(file))) {
     return { run: true };
   }
+  const editable =
+    code.length === 0 ? "" : ` other than the editable ${code.map((file) => file.path).join(", ")}`;
   return {
     run: false,
-    skipped: `${task}: skipped the tests of ${pack}, because no file of its code differs from the pack; PACK_TESTS=${pack} runs them.`,
+    skipped: `${task}: skipped the tests of ${pack}, because no file of its code differs from the pack${editable}; PACK_TESTS=${pack} runs them.`,
   };
 }
 

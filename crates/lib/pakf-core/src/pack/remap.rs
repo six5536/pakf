@@ -75,12 +75,12 @@ impl Remap {
             let (k, v) = (prefix(key)?, prefix(value)?);
             if let Some(other) = from.insert(k.clone(), key) {
                 return Err(format!(
-                    "the prefixes `{other}` and `{key}` name one prefix, so no longest prefix chooses between them"
+                    "the prefixes `{other}` and `{key}` name one prefix"
                 ));
             }
             if let Some(other) = to.insert(v.clone(), value) {
                 return Err(format!(
-                    "the mapped prefixes `{other}` and `{value}` name one prefix, so `pakf patch` has no one place in the pack for a new file below it"
+                    "the mapped prefixes `{other}` and `{value}` name one prefix"
                 ));
             }
             pairs.push((k, v));

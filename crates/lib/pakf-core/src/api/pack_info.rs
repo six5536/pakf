@@ -11,7 +11,7 @@ use super::{
     pack_keep::PackKeep,
     pack_ls::PackFileKind,
 };
-use crate::{Error, RepoPath, RepoRoot, Result, config, conflicts, pack, source::read_optional};
+use crate::{Error, RepoPath, RepoRoot, Result, config, pack, source::read_optional};
 
 /// A `PackFileState` is the state of one file of a locked pack that the pack
 /// owns, whatever its acceptance.
@@ -120,6 +120,10 @@ pub struct PackStatus {
     /// Each pack in the lock, in the order of the packs, from the lowest to
     /// the highest.
     pub packs: Vec<PackState>,
+    /// A warning for each formatter or command of `[compare]` that was
+    /// missing, failed, or ran past its limit, which the command prints on
+    /// stderr, outside its JSON.
+    pub warnings: Vec<String>,
 }
 
 impl PackStatus {
@@ -194,6 +198,7 @@ impl PackStatus {
 // sokf-implements: CLI-4_AC-9
 pub fn pack_status(root: &RepoRoot) -> Result<PackStatus> {
     let lock = pack::read_lock(root)?;
+    let meaning = pack::Meaning::open(root, pack::For::Reports)?;
     let packs = pack::ordered(root, &lock)
         .into_iter()
         .filter_map(|name| lock.packs.get(&name).map(|p| (name, p)))
@@ -203,7 +208,7 @@ pub fn pack_status(root: &RepoRoot) -> Result<PackStatus> {
                 .iter()
                 // A shadowed record is listed below, with its owner.
                 .filter_map(|(rel, f)| {
-                    let (state, acceptance) = file_state(root, rel, f)?;
+                    let (state, acceptance) = file_state(root, &meaning, &name, rel, f)?;
                     (state != PackFileState::Unchanged || acceptance.is_some()).then(|| PackFile {
                         path: f.path.clone(),
                         kind: PackFileKind::of(rel, f),
@@ -241,7 +246,10 @@ pub fn pack_status(root: &RepoRoot) -> Result<PackStatus> {
             }
         })
         .collect();
-    Ok(PackStatus { packs })
+    Ok(PackStatus {
+        packs,
+        warnings: meaning.finish(),
+    })
 }
 
 /// `file_state` returns the state and the acceptance with which `pack
@@ -249,47 +257,56 @@ pub fn pack_status(root: &RepoRoot) -> Result<PackStatus> {
 /// none when another pack shadows it, because the owner's record describes
 /// the file, and a shadowed record holds no acceptance. The state is
 /// unchanged when the file holds its base, deleted when it is absent,
-/// conflicted when it holds a conflict marker, and edited otherwise, such as
-/// when it isn't text. The acceptance is none without an acceptance in the
-/// lock, `accepted` while the file holds its accepted version, and `stale`
+/// conflicted when it holds a conflict, as `LockedFile::holds_conflict`
+/// reads one, and edited otherwise, such as when it isn't text. The
+/// acceptance is none without an acceptance in the lock, `accepted` while
+/// the file holds its accepted version, and `stale`
 /// otherwise, and always for an unchanged file. `pakf ls` takes its states
 /// from it too, so that the two commands agree.
 // sokf-implements: CLI-5_AC-7
 // sokf-implements: CLI-5_AC-25
 pub(super) fn file_state(
     root: &RepoRoot,
+    meaning: &pack::Meaning,
+    name: &str,
     rel: &str,
     f: &pack::LockedFile,
 ) -> Option<(PackFileState, Option<PackAcceptance>)> {
     if f.shadowed_by.is_some() {
         return None;
     }
-    if !is_edited(root, rel, f) {
-        // A file that holds its base holds no edit to accept.
-        let stale = f.accepted.as_ref().map(|_| PackAcceptance::Stale);
-        return Some((PackFileState::Unchanged, stale));
+    if !is_edited(root, meaning, name, rel, f) {
+        // A file that holds its base holds no edit to accept, unless it holds
+        // its accepted version, which a machine whose formatter calls the
+        // file unchanged keeps for one that can't run the formatter.
+        let acceptance = f.accepted.as_ref().map(|_| {
+            if holds_accepted(root, meaning, rel, f) {
+                PackAcceptance::Accepted
+            } else {
+                PackAcceptance::Stale
+            }
+        });
+        return Some((PackFileState::Unchanged, acceptance));
     }
     let path = RepoPath::parse(&f.path);
     let dest = path
         .as_ref()
-        .map_or(pack::Dest::Absent, |rp| pack::read_dest(&rp.to_fs(root)));
+        .map_or(pack::Dest::Absent, |rp| pack::read_dest(root, rp));
     // The bytes read as text with each invalid sequence replaced, as sync
     // and `pakf accept` read them, so that a conflict in a file that isn't
     // UTF-8 reads as one in every command. An entry that isn't a readable
     // regular file is an edit.
     // sokf-implements: CLI-2_AC-57
     // sokf-implements: CLI-2_AC-58
-    let state = match (&dest, path) {
-        (pack::Dest::Absent, _) => PackFileState::Deleted,
-        (pack::Dest::File(bytes), Some(rp))
-            if !conflicts::conflict_lines(&rp, &String::from_utf8_lossy(bytes)).is_empty() =>
-        {
+    let state = match &dest {
+        pack::Dest::Absent => PackFileState::Deleted,
+        pack::Dest::File(bytes) if f.holds_conflict(root, name, rel, bytes) => {
             PackFileState::Conflicted
         }
         _ => PackFileState::Edited,
     };
     let acceptance = f.accepted.as_ref().map(|_| {
-        if holds_accepted(root, rel, f) {
+        if holds_accepted(root, meaning, rel, f) {
             PackAcceptance::Accepted
         } else {
             PackAcceptance::Stale
@@ -311,6 +328,8 @@ pub struct PackRemoved {
     pub removed: Vec<String>,
     /// Each edited file that the command kept.
     pub kept: Vec<String>,
+    /// Each kept file that holds a conflict.
+    pub still_conflicted: Vec<String>,
     /// Each file that `--keep files` kept as the project's own.
     pub own: Vec<String>,
     /// Each pack that took over a file of the removed pack, with what the
@@ -322,6 +341,14 @@ pub struct PackRemoved {
 }
 
 impl PackRemoved {
+    /// `still_conflicted_note` returns the note of each file that the
+    /// command kept, or whose record a sync of another pack dropped, while
+    /// it holds a conflict.
+    pub(super) fn still_conflicted_note(&self) -> Option<String> {
+        let handed = self.handed.iter().flat_map(|p| &p.still_conflicted);
+        super::pack::still_conflicted_note(self.still_conflicted.iter().chain(handed))
+    }
+
     /// `conflicted` returns whether the merge of a file that the command
     /// handed to another pack conflicts.
     pub fn conflicted(&self) -> bool {
@@ -373,6 +400,9 @@ impl PackRemoved {
         for note in fixed_notes(&self.handed) {
             let _ = writeln!(out, "note: {note}");
         }
+        if let Some(note) = self.still_conflicted_note() {
+            let _ = writeln!(out, "note: {note}");
+        }
         // sokf-implements: INST-1_AC-16
         out.push_str(&self.instructions.report);
         out
@@ -409,6 +439,8 @@ pub(super) struct Removal {
     /// Each file that `--keep files` keeps as the project's own and that
     /// exists.
     pub own: Vec<String>,
+    /// Each file of `kept` and `own` that holds a conflict.
+    pub still_conflicted: Vec<String>,
     /// The copy of the pack's `instructions.md` whose text the removal hands
     /// to agent-harness-adapter to keep, which stays until the adapter has
     /// taken the text.
@@ -457,13 +489,14 @@ impl Removal {
 // sokf-implements: CLI-7_AC-9
 pub(super) fn plan_removal(
     root: &RepoRoot,
+    meaning: &pack::Meaning,
     name: &str,
     entry: &pack::LockedPack,
     owned_dests: &BTreeSet<RepoPath>,
     keep: PackKeep,
     hands: bool,
 ) -> Removal {
-    let edited = edited_files(root, entry);
+    let edited = edited_files(root, meaning, name, entry);
     let mut out = Removal::default();
     for (rel, f) in &entry.files {
         let Some(p) = RepoPath::parse(&f.path) else {
@@ -480,6 +513,10 @@ pub(super) fn plan_removal(
             continue;
         }
         let own = keep.files && p != pack::instructions_of(name);
+        if (own || edited.contains(&f.path)) && exists && f.still_conflicted(root, name, rel) {
+            // sokf-implements: CLI-1_AC-48
+            out.still_conflicted.push(f.path.clone());
+        }
         if own {
             if exists {
                 out.own.push(f.path.clone());
@@ -530,6 +567,7 @@ pub fn pack_remove(root: &RepoRoot, name: &str) -> Result<PackRemoved> {
 // sokf-implements: CLI-7_AC-4
 // sokf-implements: CLI-7_AC-21
 pub fn pack_remove_keeping(root: &RepoRoot, name: &str, keep: PackKeep) -> Result<PackRemoved> {
+    super::pack::refuse_own_links(root)?;
     let config_path = config::config_path();
     let text = read_optional(&config_path.to_fs(root))?;
     let config = match &text {
@@ -552,6 +590,9 @@ pub fn pack_remove_keeping(root: &RepoRoot, name: &str, keep: PackKeep) -> Resul
             dependents.join(", ")
         )));
     }
+    // The copies of the packs' instructions are read for the text to keep
+    // only after the lock's files are checked.
+    super::pack_run::refuse_links_out(root, &lock, &[], config.is_some())?;
     // Without `instructions`, the pack's text goes with the pack.
     // sokf-implements: CLI-7_AC-17
     let kept_text = if keep.instructions {
@@ -576,11 +617,11 @@ pub fn pack_remove_keeping(root: &RepoRoot, name: &str, keep: PackKeep) -> Resul
         kept_text.as_deref(),
         None,
     )?;
-    let (removed, kept) = report
+    let (removed, kept, still_conflicted) = report
         .undeclared
         .into_iter()
         .find(|u| u.name == name)
-        .map(|u| (u.removed, u.kept))
+        .map(|u| (u.removed, u.kept, u.still_conflicted))
         .unwrap_or_default();
     Ok(PackRemoved {
         name: name.to_string(),
@@ -588,6 +629,7 @@ pub fn pack_remove_keeping(root: &RepoRoot, name: &str, keep: PackKeep) -> Resul
         locked,
         removed,
         kept,
+        still_conflicted,
         own: kept_parts.own,
         handed: report.packs,
         instructions: report.instructions,

@@ -132,7 +132,7 @@ pub fn collisions(pack: &PackFiles, remap: &Remap) -> Vec<String> {
         };
         match first.get(&dest.to_lowercase()) {
             Some(other) => out.push(format!(
-                "{rel} lands at {dest}, where the pack's {other} lands too, so the pack has no one version of the file"
+                "{rel} lands at {dest}, where the pack's {other} lands too"
             )),
             None => {
                 first.insert(dest.to_lowercase(), rel);
@@ -148,7 +148,7 @@ pub fn collisions(pack: &PackFiles, remap: &Remap) -> Vec<String> {
             .filter(|(d, _)| d.starts_with(&below))
         {
             out.push(format!(
-                "{rel} lands at {dest}, a directory that holds the pack's {other}, so the pack has no one version of the path"
+                "{rel} lands at {dest}, a directory that holds the pack's {other}"
             ));
         }
     }

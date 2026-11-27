@@ -6,7 +6,7 @@ min_version = "2026.11.4"
 node = "26"
 python = "3.14"
 "npm:@six5536/sokf" = { version = "0.8.0", allow_low_downloads = true }
-"npm:@six5536/pakf" = { version = "0.1.1", allow_low_downloads = true }
+"npm:@six5536/pakf" = { version = "0.2.0", allow_low_downloads = true }
 "npm:oxfmt" = "0.77.0"
 shfmt = "3.14.1"
 shellcheck = "0.11.0"

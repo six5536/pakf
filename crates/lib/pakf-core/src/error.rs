@@ -47,6 +47,20 @@ pub enum Error {
     /// The code breaks one of its own invariants.
     #[error("internal: {0}")]
     Internal(String),
+
+    /// A command fails after its comparison of the files warned of a
+    /// formatter or a command of `[compare]`, and the CLI prints the
+    /// warnings before the error, whose message this is. A caller that
+    /// matches the kind of an error matches the error that
+    /// [`Error::into_warnings`] returns.
+    #[error("{error}")]
+    Warned {
+        /// `error` is the error of the command.
+        error: Box<Error>,
+        /// `warnings` are the warnings of the comparison, each without the
+        /// `warning: ` before it.
+        warnings: Vec<String>,
+    },
 }
 
 /// An error of agent-harness-adapter, whose atomic write the tool uses, is
@@ -75,6 +89,41 @@ impl Error {
         Error::Config {
             path,
             message: message.into(),
+        }
+    }
+
+    /// `warned` returns the error with the warnings `warnings` of the
+    /// command's comparison after any that it holds, or the error as it is
+    /// where `warnings` is empty.
+    #[must_use]
+    pub fn warned(self, warnings: Vec<String>) -> Self {
+        if warnings.is_empty() {
+            return self;
+        }
+        match self {
+            Error::Warned {
+                error,
+                warnings: mut held,
+            } => {
+                held.extend(warnings);
+                Error::Warned {
+                    error,
+                    warnings: held,
+                }
+            }
+            error => Error::Warned {
+                error: Box::new(error),
+                warnings,
+            },
+        }
+    }
+
+    /// `into_warnings` returns the warnings that the error holds, which come
+    /// before it, and the error without them.
+    pub fn into_warnings(self) -> (Vec<String>, Error) {
+        match self {
+            Error::Warned { error, warnings } => (warnings, *error),
+            error => (Vec::new(), error),
         }
     }
 }
@@ -110,6 +159,21 @@ mod tests {
         assert_eq!(e.to_string(), "internal: bug");
         let e: Error = agent_harness_adapter_core::Error::file("/a.toml", "bad").into();
         assert_eq!(e.to_string(), "internal: /a.toml: bad");
+    }
+
+    #[test]
+    fn a_warned_error_keeps_its_message_and_its_warnings_in_order() {
+        let e = Error::Pack("refused".into());
+        assert!(matches!(e.warned(Vec::new()), Error::Pack(_)));
+        let e = Error::Pack("refused".into())
+            .warned(vec!["a".into()])
+            .warned(vec!["b".into()]);
+        assert_eq!(e.to_string(), "pack: refused");
+        let (warnings, inner) = e.into_warnings();
+        assert_eq!(warnings, ["a", "b"]);
+        assert!(matches!(inner, Error::Pack(_)));
+        let (warnings, _) = Error::NoRepository.into_warnings();
+        assert_eq!(warnings, Vec::<String>::new());
     }
 
     #[test]

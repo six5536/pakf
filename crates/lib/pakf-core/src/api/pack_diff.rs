@@ -33,6 +33,10 @@ pub struct PackDiff {
     /// A note for each edited file that the patch leaves out, because an
     /// entry that isn't a readable regular file stands at its path.
     pub notes: Vec<String>,
+    /// A warning for each formatter or command of `[compare]` that was
+    /// missing, failed, or ran past its limit, which the command prints on
+    /// stderr, outside its JSON.
+    pub warnings: Vec<String>,
 }
 
 /// `pack_diff_with_notes` returns the edits of the pack `options.name`, or of
@@ -53,20 +57,55 @@ pub fn pack_diff_with_notes(root: &RepoRoot, options: &PackDiffOptions) -> Resul
             ));
         }
         let lock = pack::read_lock(root)?;
-        let mut out = PackDiff::default();
-        for name in pack::ordered(root, &lock) {
-            let Some(entry) = lock.packs.get(&name) else {
-                continue;
-            };
-            let e = edits(root, &name, entry, options.accepted, Purpose::Diff, &|_| {
-                true
-            })?;
-            out.patch.push_str(&e.patch);
-            out.notes.extend(e.notes);
-        }
-        return Ok(out);
+        let meaning = pack::Meaning::open(root, pack::For::Reports)?;
+        let every = every_diff(root, options, &lock, &meaning);
+        return meaning.settle(every, |r, w| r.warnings = w);
     };
     let (_, entry) = locked_by_name(root, name, "pakf diff")?;
+    let meaning = pack::Meaning::open(root, pack::For::Reports)?;
+    let one = pack_diff_of(root, options, name, &entry, &meaning);
+    meaning.settle(one, |r, w| r.warnings = w)
+}
+
+/// `every_diff` returns the edits of each pack of the lock `lock` in the
+/// order of the packs, with the comparison `meaning`, without its warnings,
+/// which `pack_diff_with_notes` adds.
+fn every_diff(
+    root: &RepoRoot,
+    options: &PackDiffOptions,
+    lock: &pack::Lock,
+    meaning: &pack::Meaning,
+) -> Result<PackDiff> {
+    let mut out = PackDiff::default();
+    for name in pack::ordered(root, lock) {
+        let Some(entry) = lock.packs.get(&name) else {
+            continue;
+        };
+        let e = edits(
+            root,
+            meaning,
+            &name,
+            entry,
+            options.accepted,
+            Purpose::Diff,
+            &|_| true,
+        )?;
+        out.patch.push_str(&e.patch);
+        out.notes.extend(e.notes);
+    }
+    Ok(out)
+}
+
+/// `pack_diff_of` returns the edits of the pack `name`, whose record is
+/// `entry`, at the paths of `options`, with the comparison `meaning`,
+/// without its warnings, which `pack_diff_with_notes` adds.
+fn pack_diff_of(
+    root: &RepoRoot,
+    options: &PackDiffOptions,
+    name: &str,
+    entry: &pack::LockedPack,
+    meaning: &pack::Meaning,
+) -> Result<PackDiff> {
     let mut paths = Vec::new();
     let mut refused = Vec::new();
     for arg in &options.paths {
@@ -92,8 +131,9 @@ pub fn pack_diff_with_notes(root: &RepoRoot, options: &PackDiffOptions) -> Resul
     }
     let e = edits(
         root,
+        meaning,
         name,
-        &entry,
+        entry,
         options.accepted,
         Purpose::Diff,
         &|dest| paths.is_empty() || paths.iter().any(|p| below(dest, p)),
@@ -101,6 +141,7 @@ pub fn pack_diff_with_notes(root: &RepoRoot, options: &PackDiffOptions) -> Resul
     Ok(PackDiff {
         patch: e.patch,
         notes: e.notes,
+        warnings: Vec::new(),
     })
 }
 
@@ -152,7 +193,8 @@ pub(super) struct Edits {
 /// that the patch never deletes such a file. A file whose copy or base copy
 /// is binary goes into the patch as a git binary patch, and into the diff as
 /// the line `Binary file <PATH> differs`, with no content, where its bytes
-/// differ from the base copy's.
+/// differ from the base copy's. The patch refuses a file that holds a
+/// conflict.
 // sokf-implements: CLI-8_AC-1
 // sokf-implements: CLI-8_AC-2
 // sokf-implements: CLI-8_AC-4
@@ -162,23 +204,27 @@ pub(super) struct Edits {
 // sokf-implements: CLI-8_AC-3
 pub(super) fn edits(
     root: &RepoRoot,
+    meaning: &pack::Meaning,
     name: &str,
     entry: &pack::LockedPack,
     accepted: bool,
     what: Purpose,
     select: &dyn Fn(&str) -> bool,
 ) -> Result<Edits> {
-    let edited = edited_files(root, entry);
+    let edited = edited_files(root, meaning, name, entry);
     let mut out = Edits::default();
     for (rel, f) in &entry.files {
         if !edited.contains(&f.path)
             || !select(&f.path)
-            || (!accepted && holds_accepted(root, rel, f))
+            || (!accepted && holds_accepted(root, meaning, rel, f))
         {
             continue;
         }
-        let dest = RepoPath::parse(&f.path).map(|p| p.to_fs(root));
-        let current = match dest.as_deref().map_or(pack::Dest::Absent, pack::read_dest) {
+        let dest = RepoPath::parse(&f.path);
+        let current = match dest
+            .as_ref()
+            .map_or(pack::Dest::Absent, |d| pack::read_dest(root, d))
+        {
             pack::Dest::Unreadable(why) => {
                 out.notes.push(format!(
                     "{}; the {} leaves it out",
@@ -189,7 +235,26 @@ pub(super) fn edits(
             }
             read => read.into_bytes(),
         };
-        let base_path = pack::base_path(name, rel).to_fs(root);
+        // A base copy through a link out of the repository would print a
+        // file of the machine as the pack's version. A link at it that leads
+        // to no file is a missing base copy, as any other.
+        // sokf-implements: CLI-8_AC-15
+        let base_copy = pack::base_path(name, rel);
+        if let Some(out_link) =
+            pack::link_out(root, &base_copy, true).filter(|o| o.leads != pack::Leads::Nowhere)
+        {
+            out.notes.push(format!(
+                "{}; the {} leaves {} out",
+                cant_read(base_copy.as_str(), &out_link.why(&base_copy)),
+                what.word(),
+                f.path
+            ));
+            continue;
+        }
+        if what == Purpose::Patch {
+            refuse_conflict(root, name, rel, f, current.as_deref())?;
+        }
+        let base_path = base_copy.to_fs(root);
         let base = fs::read(&base_path).map_err(|e| Error::io(&base_path, e))?;
         // A pack's version that holds CRLF, which a pack commits without a
         // `text` attribute, under `-text`, or with a lone carriage return,
@@ -222,9 +287,9 @@ pub(super) fn edits(
         // records, so the patch carries a change of the bit too.
         // sokf-implements: CLI-8_AC-5
         let modes = dest
-            .as_deref()
+            .as_ref()
             .filter(|_| pack::carries_mode(rel))
-            .map(|p| (f.executable, pack::file_is_executable(p)));
+            .map(|p| (f.executable, pack::file_is_executable(&p.to_fs(root))));
         let binary = pack::is_binary(&base) || current.as_deref().is_some_and(pack::is_binary);
         // The pack refuses a binary file that pakf reads as text, so the
         // patch never sends one.
@@ -261,6 +326,27 @@ pub(super) fn edits(
         out.patch.push_str(&diff);
     }
     Ok(out)
+}
+
+/// `refuse_conflict` refuses the file `rel` of the pack `name`, whose
+/// record is `f` and whose copy holds `current`, where the copy holds a
+/// conflict, because a patch that carried it would put its markers into the
+/// pack's repository.
+// sokf-implements: CLI-9_AC-39
+fn refuse_conflict(
+    root: &RepoRoot,
+    name: &str,
+    rel: &str,
+    f: &pack::LockedFile,
+    current: Option<&[u8]>,
+) -> Result<()> {
+    if current.is_some_and(|c| f.holds_conflict(root, name, rel, c)) {
+        return Err(Error::Pack(format!(
+            "{}: the file holds a conflict; resolve it, then patch again",
+            f.path
+        )));
+    }
+    Ok(())
 }
 
 /// A `Purpose` is what `edits` makes: the diff of `pakf diff`, which shows

@@ -58,6 +58,9 @@ pub struct SyncedPack {
     pub reasons: BTreeMap<String, String>,
     /// A note for each file whose shadowed version the pack changed.
     pub notes: Vec<String>,
+    /// Each file whose record the sync dropped and that it kept while the
+    /// file holds a conflict.
+    pub still_conflicted: Vec<String>,
     /// Whether the sync fetched the pack, or read it from its base copies
     /// because only the owners of its files changed.
     pub fetched: bool,
@@ -73,11 +76,13 @@ pub struct UndeclaredPack {
     pub removed: Vec<String>,
     /// Each edited file that the sync kept.
     pub kept: Vec<String>,
+    /// Each kept file that holds a conflict.
+    pub still_conflicted: Vec<String>,
 }
 
 /// `DELETED_NOTE` is the note of the text of a sync or a removal that keeps
 /// a deleted file deleted.
-pub(super) const DELETED_NOTE: &str = "a deleted file is your edit, so the sync keeps it deleted; to restore it, copy its base copy from /.pakf/packs/<ID>/base/ back";
+pub(super) const DELETED_NOTE: &str = "the deleted file stays deleted; to restore it, copy its base copy from /.pakf/packs/<ID>/base/ back";
 
 /// A `PackSyncReport` is the report of `pakf sync` and `pakf add`.
 #[derive(Debug, Clone)]
@@ -156,9 +161,40 @@ impl PackSyncReport {
         for note in fixed_notes(&self.packs) {
             let _ = writeln!(out, "note: {note}");
         }
+        if let Some(note) = self.still_conflicted_note() {
+            let _ = writeln!(out, "note: {note}");
+        }
         // sokf-implements: INST-1_AC-16
         out.push_str(&self.instructions.report);
         out
+    }
+}
+
+impl PackSyncReport {
+    /// `still_conflicted_note` returns the note of each file whose record
+    /// the sync dropped and that still holds a conflict, as
+    /// `still_conflicted_note` of the module says.
+    pub(super) fn still_conflicted_note(&self) -> Option<String> {
+        let undeclared = self.undeclared.iter().flat_map(|u| &u.still_conflicted);
+        still_conflicted_note(undeclared.chain(self.packs.iter().flat_map(|p| &p.still_conflicted)))
+    }
+}
+
+/// `still_conflicted_note` returns one note, without its `note: `, that
+/// names each file of `paths`, which a command kept and whose record it
+/// dropped while the file holds a conflict, such as `/a.md still holds a
+/// conflict`, or none without such a file. pakf no longer reports the
+/// conflict of a file that no pack owns, so the note says it once.
+// sokf-implements: CLI-1_AC-48
+pub(super) fn still_conflicted_note<'a>(paths: impl Iterator<Item = &'a String>) -> Option<String> {
+    let paths: Vec<&str> = paths.map(String::as_str).collect();
+    match paths.as_slice() {
+        [] => None,
+        [one] => Some(format!("{one} still holds a conflict")),
+        [rest @ .., last] => Some(format!(
+            "{} and {last} still hold a conflict",
+            rest.join(", ")
+        )),
     }
 }
 
@@ -186,6 +222,7 @@ pub(super) fn fixed_notes(packs: &[SyncedPack]) -> Vec<&'static str> {
 // sokf-implements: CLI-2_AC-10
 // sokf-implements: CLI-2_AC-32
 pub fn pack_sync(root: &RepoRoot, opts: &PackSyncOptions) -> Result<PackSyncReport> {
+    refuse_own_links(root)?;
     let entries = config::read_packs(root)?;
     refuse_undeclared_lock(root, &entries)?;
     run(
@@ -212,6 +249,9 @@ pub fn pack_sync(root: &RepoRoot, opts: &PackSyncOptions) -> Result<PackSyncRepo
 // sokf-implements: CLI-3_AC-1
 // sokf-implements: CLI-3_AC-2
 pub fn pack_add(root: &RepoRoot, opts: &PackAddOptions) -> Result<PackSyncReport> {
+    refuse_own_links(root)?;
+    // The lock's files are checked before the fetch.
+    super::pack_run::refuse_links_out(root, &pack::read_lock(root)?, &[], true)?;
     let source = Source::Git(pack::recorded(&opts.source, root.as_path(), &opts.cwd));
     let fetched = fetch(root, &source, opts.git_ref.as_deref(), opts.path.as_deref())?;
     let name = fetched.pack.manifest.name.clone();
@@ -252,6 +292,19 @@ pub fn pack_add(root: &RepoRoot, opts: &PackAddOptions) -> Result<PackSyncReport
     )?;
     report.declared = Some(name);
     Ok(report)
+}
+
+/// `refuse_own_links` refuses a command whose lock or configuration lies
+/// below a symbolic link that leads out of the repository, or stands at one
+/// or at a link that leads to no file, before the command reads either, so
+/// that the refusal names the link, and no file outside the repository is
+/// read as pakf's own.
+// sokf-implements: CLI-2_AC-90
+pub(super) fn refuse_own_links(root: &RepoRoot) -> Result<()> {
+    pack::refuse_links_out(
+        root,
+        [(pack::lock_path(), true), (config::config_path(), true)],
+    )
 }
 
 /// `refuse_undeclared_lock` refuses a sync while no `[[pack]]` entry
@@ -354,6 +407,8 @@ pub(super) fn fetch(
 /// are deleted before, by `apply_removal`.
 // sokf-implements: CLI-2_AC-5
 // sokf-implements: CLI-2_AC-65
+// A sync writes each file as its plan holds it, and runs no formatter on it.
+// sokf-implements: CLI-2_AC-88
 pub(super) fn apply(root: &RepoRoot, plans: &[PackPlan], lock: &Lock) -> Result<()> {
     let writes: BTreeSet<&RepoPath> = plans
         .iter()
@@ -430,49 +485,95 @@ pub(super) fn remove(root: &RepoRoot, path: &RepoPath) -> Result<()> {
     Ok(())
 }
 
-/// `edited_files` returns the destination of each file of a locked pack
-/// that is missing, whose content differs from its base, with each CRLF
-/// read as LF, or, for a file of `files/`, whose executable bit differs from
+/// `edited_files` returns the destination of each file of the locked pack
+/// `name` that is missing, whose content differs from its base, with each
+/// CRLF read as LF, and from the meaning of its base copy, as `meaning`
+/// reads it, or, for a file of `files/`, whose executable bit differs from
 /// the bit that the lock records. A shadowed file holds another pack's
 /// version, so it is never this pack's edit.
 // sokf-implements: CLI-1_AC-25
 // sokf-implements: CLI-8_AC-4
-pub(super) fn edited_files(root: &RepoRoot, pack: &pack::LockedPack) -> BTreeSet<String> {
+pub(super) fn edited_files(
+    root: &RepoRoot,
+    meaning: &pack::Meaning,
+    name: &str,
+    pack: &pack::LockedPack,
+) -> BTreeSet<String> {
     pack.files
         .iter()
-        .filter(|(rel, f)| is_edited(root, rel, f))
+        .filter(|(rel, f)| is_edited(root, meaning, name, rel, f))
         .map(|(_, f)| f.path.clone())
         .collect()
 }
 
-/// `is_edited` returns whether the file `rel` of a locked pack, whose record
-/// is `f`, is one of the pack's edited files, as `edited_files` says.
-pub(super) fn is_edited(root: &RepoRoot, rel: &str, f: &pack::LockedFile) -> bool {
+/// `is_edited` returns whether the file `rel` of the locked pack `name`,
+/// whose record is `f`, is one of the pack's edited files, as
+/// `edited_files` says.
+pub(super) fn is_edited(
+    root: &RepoRoot,
+    meaning: &pack::Meaning,
+    name: &str,
+    rel: &str,
+    f: &pack::LockedFile,
+) -> bool {
     if f.shadowed_by.is_some() {
         return false;
     }
-    let Some(path) = RepoPath::parse(&f.path).map(|p| p.to_fs(root)) else {
+    let Some(at) = RepoPath::parse(&f.path) else {
         return true;
     };
+    let path = at.to_fs(root);
     // An absent file is a deletion, and an entry that isn't a readable
     // regular file is an edit.
     // sokf-implements: CLI-2_AC-58
-    let dest = pack::read_dest(&path);
-    !f.holds_base(&dest, pack::carried_bit(rel, &dest, &path))
+    let dest = pack::read_dest(root, &at);
+    let base_copy = pack::base_path(name, rel).to_fs(root);
+    !f.holds_base(
+        &dest,
+        pack::carried_bit(rel, &dest, &path),
+        &base_copy,
+        meaning,
+    )
 }
 
 /// `holds_accepted` returns whether the file `rel` of a locked pack, whose
 /// record is `f`, holds the version that its acceptance records: the
-/// accepted text, with each CRLF read as LF, and the accepted executable bit
+/// accepted meaning, as `meaning` reads it, and the accepted executable bit
 /// for a file of `files/`, or no file for an accepted deletion.
-pub(super) fn holds_accepted(root: &RepoRoot, rel: &str, f: &pack::LockedFile) -> bool {
+pub(super) fn holds_accepted(
+    root: &RepoRoot,
+    meaning: &pack::Meaning,
+    rel: &str,
+    f: &pack::LockedFile,
+) -> bool {
     let Some(accepted) = &f.accepted else {
         return false;
     };
-    let path = RepoPath::parse(&f.path).map(|p| p.to_fs(root));
-    let dest = path.as_deref().map_or(pack::Dest::Absent, pack::read_dest);
-    let bit = path
-        .as_deref()
-        .and_then(|p| pack::carried_bit(rel, &dest, p));
-    accepted.holds(&dest, bit)
+    let Some(at) = RepoPath::parse(&f.path) else {
+        return accepted.holds(&pack::Dest::Absent, None, &RepoPath::root(), meaning);
+    };
+    let path = at.to_fs(root);
+    let dest = pack::read_dest(root, &at);
+    let bit = pack::carried_bit(rel, &dest, &path);
+    accepted.holds(&dest, bit, &at, meaning)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::still_conflicted_note;
+
+    // sokf-tests: CLI-1_AC-48
+    #[test]
+    fn one_note_names_each_file_that_still_holds_a_conflict() {
+        let note = |paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|p| (*p).to_string()).collect();
+            still_conflicted_note(paths.iter())
+        };
+        assert_eq!(note(&[]), None);
+        assert_eq!(note(&["/a.md"]).unwrap(), "/a.md still holds a conflict");
+        assert_eq!(
+            note(&["/a.md", "/b.md", "/c.md"]).unwrap(),
+            "/a.md, /b.md and /c.md still hold a conflict"
+        );
+    }
 }

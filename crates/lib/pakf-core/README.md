@@ -6,8 +6,12 @@ through packs. It reads a project's packs and its lock, fetches each pack
 through the `git` of the machine, merges each change of a pack into the
 project's edits, and runs each command of `pakf`.
 
-The library serves the `pakf` command, and its interface can change in any
-release before 1.0. To share files through packs, install the command:
+## Status
+
+**Unstable.** The library is at a 0.x version, and its interface can change in any release.
+
+The library serves the `pakf` command. To share files through packs, install
+the command:
 
 ```sh
 cargo install pakf

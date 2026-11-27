@@ -9,6 +9,7 @@ mod ignore;
 mod landing;
 mod lock;
 mod manifest;
+mod meaning;
 mod mode;
 mod order;
 mod owner;
@@ -17,10 +18,11 @@ mod remap;
 mod source;
 
 pub use dest::{Dest, empties, entry_above, is_absent, read_dest};
+pub(crate) use dest::{Leads, link_out, refuse_links_out};
 pub(crate) use eol::{Reading, committed, has_crlf};
 pub use eol::{is_base, is_binary, normalise};
 pub use git::{TempDir, apply, diff, diff_modes, merge_file, shallow_clone};
-pub(crate) use ignore::Ignores;
+pub(crate) use ignore::{Ignores, literal_braces};
 pub use landing::{below, is_text, own_ignores, refusal};
 pub(crate) use lock::ordered;
 pub use lock::{
@@ -31,6 +33,7 @@ pub use manifest::{
     EDITABLE, MANIFEST, PackManifest, ids_named, is_pack_id, is_slug, parse_manifest,
     requires_newer, split_id, tool_version,
 };
+pub use meaning::{CACHE_DIR, For, Meaning};
 pub use mode::{carried_bit, carries_mode, file_is_executable, set_executable};
 pub use order::precedence;
 pub use owner::{Ownership, Shadow, Supply, Takeover, owners};

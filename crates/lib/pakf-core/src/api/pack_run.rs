@@ -98,6 +98,12 @@ pub(super) fn run_keeping(
 ) -> Result<(PackSyncReport, Kept)> {
     let lock = pack::read_lock(root)?;
     check_entries(r, &lock)?;
+    // The lock's files go first, because the packs that the run doesn't
+    // fetch are read from their base copies.
+    refuse_links_out(root, &lock, &[], r.config.is_some())?;
+    // A sync writes by the library's own reading alone, so that every
+    // machine writes the same files and the same lock.
+    let meaning = pack::Meaning::open(root, pack::For::Writes)?;
     let declared: BTreeSet<&str> = r.entries.iter().map(|e| e.name.as_str()).collect();
     let undeclared: Vec<String> = lock
         .packs
@@ -113,6 +119,7 @@ pub(super) fn run_keeping(
     // The clones live until the plans are written, because a plan holds
     // only the bytes that it read from them.
     let packs = gather(root, r, &lock, prefetched)?;
+    refuse_links_out(root, &lock, &packs, r.config.is_some())?;
     check_depends(r.entries, &packs)?;
     let order = order_of(&packs)?;
     let base = Request {
@@ -134,6 +141,7 @@ pub(super) fn run_keeping(
         .collect();
     let mut removals = plan_removals(
         root,
+        &meaning,
         &lock,
         &undeclared,
         (r.remove_only, keep, kept_text.is_some()),
@@ -146,11 +154,9 @@ pub(super) fn run_keeping(
     let vacated: BTreeSet<RepoPath> = removals
         .iter()
         .flat_map(|(_, r)| r.deletes.iter().cloned())
-        .chain(
-            packs
-                .iter()
-                .flat_map(|(e, f)| pack::dropping(root, lock.packs.get(&e.name), f, &owned_dests)),
-        )
+        .chain(packs.iter().flat_map(|(e, f)| {
+            pack::dropping(root, &meaning, lock.packs.get(&e.name), f, &owned_dests)
+        }))
         .collect();
     let mut plans: Vec<(bool, PackPlan)> = Vec::new();
     for (entry, f) in &packs {
@@ -159,7 +165,7 @@ pub(super) fn run_keeping(
             owned_dests: owned_dests.clone(),
             ..base.clone()
         };
-        let plan = pack::plan(root, &working, f, &request, &owners[&entry.name])?;
+        let plan = pack::plan(root, &meaning, &working, f, &request, &owners[&entry.name])?;
         working.packs.insert(plan.name.clone(), plan.entry.clone());
         plans.push((!f.offline, plan));
     }
@@ -182,6 +188,7 @@ pub(super) fn run_keeping(
         removal.settle(root, taken)?;
     }
     let kept = Kept::of(&mut removals, removed);
+    meaning.finish();
     Ok((sync_report(removals, plans, instructions), kept))
 }
 
@@ -190,6 +197,7 @@ pub(super) fn run_keeping(
 /// it holds back for agent-harness-adapter where `keep.2` says.
 fn plan_removals(
     root: &RepoRoot,
+    meaning: &pack::Meaning,
     lock: &Lock,
     undeclared: &[String],
     keep: (Option<&str>, PackKeep, bool),
@@ -203,7 +211,15 @@ fn plan_removals(
             } else {
                 (PackKeep::default(), false)
             };
-            let r = plan_removal(root, name, &lock.packs[name], owned_dests, k, hands);
+            let r = plan_removal(
+                root,
+                meaning,
+                name,
+                &lock.packs[name],
+                owned_dests,
+                k,
+                hands,
+            );
             (name.clone(), r)
         })
         .collect()
@@ -269,6 +285,43 @@ fn refuse_writes_below_entries(
         "the sync writes files below entries that aren't directories, or at directories, so it writes no file: {}; move each entry of the project away, or remove one of two packs whose files collide, then sync again",
         below.join("; ")
     )))
+}
+
+/// `refuse_links_out` refuses a run that handles a file below a symbolic
+/// link that leads out of the repository, as `pack::link_out` finds it,
+/// before it plans, because a plan reads each destination: the destination
+/// of each file of `packs` and of each file that `lock` records, which no
+/// write follows where a link stands at it, the base copy of each, the
+/// lock, and the configuration where `config` says that the run writes it,
+/// whose writes follow a link at their path.
+// sokf-implements: CLI-2_AC-89
+// sokf-implements: CLI-2_AC-90
+pub(super) fn refuse_links_out(
+    root: &RepoRoot,
+    lock: &Lock,
+    packs: &[(&PackEntry, Fetched)],
+    config: bool,
+) -> Result<()> {
+    let fetched = packs.iter().flat_map(|(_, f)| {
+        let name = f.pack.manifest.name.as_str();
+        f.pack.files.keys().flat_map(move |rel| {
+            let dest = pack::destination(name, &f.remap, rel).and_then(|d| RepoPath::parse(&d));
+            dest.map(|d| (d, false))
+                .into_iter()
+                .chain([(pack::base_path(name, rel), true)])
+        })
+    });
+    let locked = lock.packs.iter().flat_map(|(name, p)| {
+        p.files.iter().flat_map(move |(rel, f)| {
+            RepoPath::parse(&f.path)
+                .map(|d| (d, false))
+                .into_iter()
+                .chain([(pack::base_path(name, rel), true)])
+        })
+    });
+    let own = std::iter::once((pack::lock_path(), true))
+        .chain(config.then(|| (config::config_path(), true)));
+    pack::refuse_links_out(root, fetched.chain(locked).chain(own))
 }
 
 /// `check_entries` refuses a sync that fetches a pack that no entry of `r`
@@ -386,6 +439,7 @@ fn sync_report(
                 name,
                 removed: r.removed,
                 kept: r.kept,
+                still_conflicted: r.still_conflicted,
             })
             .collect(),
         packs: plans
@@ -406,6 +460,11 @@ fn sync_report(
                     .map(|(d, why)| (d.as_str().to_string(), why))
                     .collect(),
                 notes: p.notes,
+                still_conflicted: p
+                    .still_conflicted
+                    .into_iter()
+                    .map(|d| d.as_str().to_string())
+                    .collect(),
                 name: p.name,
             })
             .collect(),

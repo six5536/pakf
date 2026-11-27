@@ -5,6 +5,7 @@
 
 mod block;
 mod refresh;
+mod words;
 
 pub use refresh::Instructions;
 pub(crate) use refresh::{kept_text, refresh};

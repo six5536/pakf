@@ -6,6 +6,10 @@ pack that a project declares into the project, records the base of each file
 in a lock, and merges each later change of the pack into the project's own
 edits. `pakf patch` sends the project's edits back to the pack.
 
+## Status
+
+**Unstable.** `pakf` is at a 0.x version, and its commands, options and file formats can change in any release.
+
 ## Install
 
 ```sh

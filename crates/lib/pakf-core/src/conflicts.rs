@@ -1,7 +1,11 @@
 //! The conflict check: a line that begins with git's conflict marker
 //! `<<<<<<< ` begins a conflict that a merge of a sync left for the user to
 //! resolve. A line inside a fenced code block of a Markdown file is an
-//! example of a conflict, such as one in a recipe, so the check passes it by.
+//! example of a conflict, such as one in a recipe, so the check passes it by,
+//! except the line that opens a conflict of pakf's own merge in a file in
+//! which a sync left one, which the lock records, unless its lines up to
+//! the next line that closes a conflict stand in the pack's version, as an
+//! example that the pack shows.
 //! The reader of fences follows the blocks of `CommonMark` 0.31.2 at the top
 //! level and in list items, so that a line of backticks inside another block,
 //! such as an HTML comment, opens no fence.
@@ -19,29 +23,66 @@ pub const MARKER: &str = "<<<<<<< ";
 /// with the text `text`, that begins a conflict, from 1. In a Markdown file,
 /// a line inside a fenced code block doesn't count, except in a file whose
 /// frontmatter gives `type: Schema`, whose fence is the file's content
-/// itself, so that a merge of such a file conflicts inside it.
+/// itself, so that a merge of such a file conflicts inside it. Where `left`
+/// holds the pack's version of a file in which a sync left a conflict, the
+/// line that opens a conflict of pakf's merge, as `is_opening` reads it,
+/// counts inside a fence too, unless the lines from it to the next line
+/// that closes a conflict stand in that version one after another, as an
+/// example that the pack shows. A line that no closing line follows is no
+/// example.
 #[expect(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "only a name that ends in a lowercase `.md` is Markdown, so the comparison is case-sensitive on purpose"
 )]
 // sokf-implements: CLI-1_AC-20
-pub fn conflict_lines(path: &crate::RepoPath, text: &str) -> Vec<usize> {
-    let marked: Vec<usize> = text
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| l.starts_with(MARKER))
-        .map(|(i, _)| i)
+// sokf-implements: CLI-1_AC-47
+pub fn conflict_lines(path: &crate::RepoPath, text: &str, left: Option<&str>) -> Vec<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    let marked: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].starts_with(MARKER))
         .collect();
     let skip = if !marked.is_empty() && path.as_str().ends_with(".md") && !is_schema(text) {
         fences(text)
     } else {
         Vec::new()
     };
-    marked
+    let (mut out, fenced): (Vec<usize>, Vec<usize>) = marked
         .into_iter()
-        .filter(|i| !skip.iter().any(|f| f.contains(i)))
-        .map(|i| i + 1)
-        .collect()
+        .partition(|i| !skip.iter().any(|f| f.contains(i)));
+    if let Some(version) = left {
+        let version: Vec<&str> = version.lines().collect();
+        out.extend(fenced.into_iter().filter(|&i| {
+            is_opening(path, lines[i]) && block(&lines[i..]).is_none_or(|b| !shows(&version, b))
+        }));
+        out.sort_unstable();
+    }
+    out.into_iter().map(|i| i + 1).collect()
+}
+
+/// `CLOSING` is the start of the last line of a conflict that git writes.
+const CLOSING: &str = ">>>>>>> ";
+
+/// `block` returns the lines of `lines` from its first, which opens a
+/// conflict, to the next line that closes one, or none where no line closes
+/// it.
+fn block<'a>(lines: &'a [&'a str]) -> Option<&'a [&'a str]> {
+    let end = lines.iter().skip(1).position(|l| l.starts_with(CLOSING))?;
+    Some(&lines[..end + 2])
+}
+
+/// `shows` returns whether `version` holds the lines of `block` in the
+/// same order, one after another.
+fn shows(version: &[&str], block: &[&str]) -> bool {
+    version.windows(block.len()).any(|w| w == block)
+}
+
+/// `is_opening` returns whether `line` is the line that opens a conflict of
+/// pakf's merge of the file `path`, which labels it with the file's path, as
+/// `git merge-file -L` writes it, such as `<<<<<<< /knowledge/a.md`, with
+/// nothing after the path but spaces or tabs.
+pub fn is_opening(path: &crate::RepoPath, line: &str) -> bool {
+    line.strip_prefix(MARKER)
+        .is_some_and(|rest| rest.trim_end_matches([' ', '\t']) == path.as_str())
 }
 
 /// `is_schema` returns whether the frontmatter of the Markdown text `text`,
@@ -386,7 +427,7 @@ mod tests {
     use crate::RepoPath;
 
     fn lines(path: &str, text: &str) -> Vec<usize> {
-        conflict_lines(&RepoPath::parse(path).unwrap(), text)
+        conflict_lines(&RepoPath::parse(path).unwrap(), text, None)
     }
 
     /// `md` returns the lines that begin a conflict in a Markdown file.
@@ -406,6 +447,48 @@ mod tests {
         assert_eq!(lines("/knowledge/a.md", text), vec![2]);
         assert_eq!(lines("/.pakf/packs/m/formats.yaml", text), vec![2]);
         assert_eq!(lines("/knowledge/a.md", "no conflict\n"), [] as [usize; 0]);
+    }
+
+    // sokf-tests: CLI-1_AC-47
+    #[test]
+    fn the_opening_line_of_a_conflict_that_a_sync_left_counts_in_a_fence() {
+        let path = RepoPath::parse("/knowledge/a.md").unwrap();
+        let shown =
+            "```text\n<<<<<<< /knowledge/a.md\nmine\n=======\ntheirs\n>>>>>>> upstream\n```\n";
+        let left = format!(
+            "{shown}\n```text\n<<<<<<< /knowledge/a.md\r\nours\n=======\ntheirs\n>>>>>>> upstream\n```\n"
+        );
+        // Without the record, both are examples.
+        assert_eq!(conflict_lines(&path, &left, None), [] as [usize; 0]);
+        // With it, the conflict counts, and the example that the pack's
+        // version shows doesn't.
+        assert_eq!(conflict_lines(&path, &left, Some(shown)), vec![10]);
+        assert_eq!(conflict_lines(&path, &left, Some("")), vec![2, 10]);
+        // The conflict counts where the project dropped the pack's example
+        // too, and an opening line that no closing line follows is no
+        // example, even as the last line.
+        let alone = &left[shown.len()..];
+        assert_eq!(conflict_lines(&path, alone, Some(shown)), vec![3]);
+        let open = "```text\n<<<<<<< /knowledge/a.md\nmine\n```\n";
+        assert_eq!(conflict_lines(&path, open, Some(shown)), vec![2]);
+        let last = "```text\n<<<<<<< /knowledge/a.md";
+        assert_eq!(conflict_lines(&path, last, Some(shown)), vec![2]);
+        // Once the conflict goes, the pack's example stays an example, and
+        // another label is never pakf's.
+        assert_eq!(conflict_lines(&path, shown, Some(shown)), [] as [usize; 0]);
+        let other = "```text\n<<<<<<< HEAD\n<<<<<<< /knowledge/a.md.orig\n```\n";
+        assert_eq!(conflict_lines(&path, other, Some("")), [] as [usize; 0]);
+        assert!(is_opening(&path, "<<<<<<< /knowledge/a.md  "));
+        assert!(is_opening(&path, "<<<<<<< /knowledge/a.md \t"));
+        // Only spaces and tabs may follow the path, as the criterion says.
+        assert!(!is_opening(&path, "<<<<<<< /knowledge/a.md\u{a0}"));
+        assert!(!is_opening(&path, "<<<<<<< /knowledge/a.md\u{c}"));
+        // The pack's example matches only where its lines stand one after
+        // another in the pack's version.
+        let apart =
+            "```text\n<<<<<<< /knowledge/a.md\nmine\n\n=======\ntheirs\n>>>>>>> upstream\n```\n";
+        assert_eq!(conflict_lines(&path, shown, Some(apart)), vec![2]);
+        assert!(!is_opening(&path, " <<<<<<< /knowledge/a.md"));
     }
 
     // sokf-tests: CLI-1_AC-20

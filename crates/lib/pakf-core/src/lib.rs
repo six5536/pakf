@@ -6,6 +6,9 @@
 //! The binary (`crates/app/pakf`) parses the arguments and renders the
 //! output. The logic that the binary drives lives here, so that tests can
 //! run that logic without starting a process.
+//!
+//! **This crate is unstable.** It is at a 0.x version, and its interface can
+//! change in any release.
 
 #![warn(missing_docs)]
 

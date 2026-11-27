@@ -40,7 +40,8 @@ pub fn normalise(bytes: &[u8]) -> Cow<'_, [u8]> {
 }
 
 /// `same_text` returns whether `a` and `b` hold the same bytes once each CRLF
-/// is read as LF, as `normalise` reads it.
+/// is read as LF, as `normalise` reads it. Two texts that it calls
+/// different can still mean the same, as the module `meaning` reads them.
 pub fn same_text(a: &[u8], b: &[u8]) -> bool {
     normalise(a) == normalise(b)
 }

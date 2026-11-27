@@ -1,6 +1,6 @@
 [package]
 name = "pakf-core"
-description = "The library of pakf, which shares project files through packs."
+description = "The library of pakf, which shares project files through packs. Unstable: its interface can change in any release."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,10 +12,11 @@ categories = ["development-tools"]
 include = ["/src", "/README.md", "/LICENSE"]
 
 [dependencies]
-agent-harness-adapter-core = "0.4.0"
+agent-harness-adapter-core = "0.5.0"
 dunce = "1.0"
 ignore = "0.4"
 jmespath = "0.5"
+same-same.workspace = true
 saphyr = "0.1"
 saphyr-parser = "0.1"
 schemars = "1.2"

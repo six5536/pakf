@@ -72,7 +72,7 @@ pub fn parse_manifest(text: &str, label: &str) -> Result<PackManifest> {
         let unquoted = starts_with_at(text);
         if unquoted {
             fail(format!(
-                "{e}; YAML reads no plain value that begins with `@`, so quote a pack's id, as in `name: \"@acme/method\"`"
+                "{e}; quote a pack's id, as in `name: \"@acme/method\"`"
             ))
         } else {
             fail(e.to_string())

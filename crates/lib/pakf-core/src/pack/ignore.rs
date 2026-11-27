@@ -55,7 +55,7 @@ impl Ignores {
             .case_insensitive(cfg!(any(windows, target_os = "macos")))
             .map_err(|e| Error::Pack(e.to_string()))?;
         for file in &files {
-            let text = match read_dest(&file.to_fs(root)) {
+            let text = match read_dest(root, file) {
                 Dest::File(bytes) => {
                     String::from_utf8(bytes).map_err(|_| refuse(file, "the text isn't UTF-8"))?
                 }
@@ -114,7 +114,7 @@ impl Ignores {
 /// `literal_braces` returns the pattern `line` with each brace that no
 /// backslash escapes escaped, because git's patterns have no alternation of
 /// `{a,b}`, which the glob of the crate `ignore` reads.
-fn literal_braces(line: &str) -> String {
+pub(crate) fn literal_braces(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let (mut escaped, mut class) = (false, false);
     for c in line.chars() {

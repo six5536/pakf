@@ -10,7 +10,7 @@ import process from "node:process";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { isCode, packTests, parseReport } from "./pack-tests.mts";
-import type { PackReport } from "./pack-tests.mts";
+import type { PackFile, PackReport } from "./pack-tests.mts";
 
 const script = fileURLToPath(new URL("pack-tests.mts", import.meta.url));
 const core = "@six5536/project-core";
@@ -18,7 +18,7 @@ const ts = "@six5536/typescript";
 const task = { MISE_TASK_NAME: "test:fast:core" };
 const skipped = `test:fast:core: skipped the tests of ${core}, because no file of its code differs from the pack; PACK_TESTS=${core} runs them.`;
 
-function report(...files: { path: string; state: string }[]): PackReport[] {
+function report(...files: PackFile[]): PackReport[] {
   return [
     { name: core, files },
     { name: ts, files: [{ path: "/.config/vitest/vitest.base.mts", state: "edited" }] },
@@ -43,6 +43,38 @@ test("an accepted edit runs the tests, and an accepted file that holds its base 
   assert.deepEqual(packTests(core, report({ path: "/.gitignore", state: "unchanged" }), task), {
     run: false,
     skipped,
+  });
+});
+
+test("an edited editable file runs no test, and the skip names it", () => {
+  const files = report(
+    { path: "/Cargo.toml", state: "edited", kind: "editable" },
+    { path: "/LICENSE", state: "edited", kind: "editable" },
+  );
+  assert.deepEqual(packTests(core, files, task), {
+    run: false,
+    skipped: `test:fast:core: skipped the tests of ${core}, because no file of its code differs from the pack other than the editable /Cargo.toml, /LICENSE; PACK_TESTS=${core} runs them.`,
+  });
+});
+
+test("a conflicted or deleted editable file runs the tests", () => {
+  for (const state of ["conflicted", "deleted"]) {
+    const files = report({ path: "/Cargo.toml", state, kind: "editable" });
+    assert.deepEqual(packTests(core, files, task), { run: true }, state);
+  }
+});
+
+test("an edited editable file beside another edited file of the code runs the tests", () => {
+  const files = report(
+    { path: "/Cargo.toml", state: "edited", kind: "editable" },
+    { path: "/.gitignore", state: "edited", kind: "file" },
+  );
+  assert.deepEqual(packTests(core, files, task), { run: true });
+});
+
+test("an edited file without a kind, as pakf 0.1.1 reports it, runs the tests", () => {
+  assert.deepEqual(packTests(core, report({ path: "/Cargo.toml", state: "edited" }), task), {
+    run: true,
   });
 });
 
@@ -125,6 +157,28 @@ test("the report keeps each pack's name and its files' paths and states", () => 
   ]);
 });
 
+test("the report keeps each file's kind where pakf gives one", () => {
+  const text = JSON.stringify([
+    {
+      name: core,
+      files: [
+        { path: "/Cargo.toml", kind: "editable", state: "edited", acceptance: null, note: null },
+        { path: "/.gitignore", kind: "file", state: "deleted", acceptance: null, note: null },
+      ],
+      shadowed: [],
+    },
+  ]);
+  assert.deepEqual(parseReport(text), [
+    {
+      name: core,
+      files: [
+        { path: "/Cargo.toml", state: "edited", kind: "editable" },
+        { path: "/.gitignore", state: "deleted", kind: "file" },
+      ],
+    },
+  ]);
+});
+
 test("a report that isn't pakf's is refused", () => {
   assert.throws(() => parseReport("not json"), SyntaxError);
   assert.throws(() => parseReport("{}"), /isn't a list of packs/u);
@@ -132,6 +186,11 @@ test("a report that isn't pakf's is refused", () => {
   assert.throws(
     () => parseReport('[{ "name": "x", "files": [{ "path": "/a" }] }]'),
     /a file of x/u,
+  );
+  assert.throws(
+    () =>
+      parseReport('[{ "name": "x", "files": [{ "path": "/a", "state": "edited", "kind": 1 }] }]'),
+    /the file \/a of x has a kind that isn't a string/u,
   );
 });
 
@@ -204,6 +263,18 @@ test("the script prints the skip and runs no test while the pack is unedited", (
   const result = runScript([core, "fail.test.mjs"], { PAKF_OUTPUT: unedited });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, `${skipped}\n`);
+});
+
+test("the script prints the skip with the editable file and runs no test", () => {
+  const output = JSON.stringify([
+    { name: core, files: [{ path: "/Cargo.toml", kind: "editable", state: "edited" }] },
+  ]);
+  const result = runScript([core, "fail.test.mjs"], { PAKF_OUTPUT: output });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    result.stdout,
+    `test:fast:core: skipped the tests of ${core}, because no file of its code differs from the pack other than the editable /Cargo.toml; PACK_TESTS=${core} runs them.\n`,
+  );
 });
 
 test("the script runs the tests of a pack that pakf records no base for, with the note", () => {

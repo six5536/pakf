@@ -10,8 +10,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use self::local::{apply_target, local_dir};
 use super::pack_diff::{Purpose, cant_read, edits};
 use crate::{Error, RepoPath, RepoRoot, Result, config, pack};
+
+mod local;
 
 /// `PackPatchOptions` holds the options of `pakf patch`.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +51,10 @@ pub struct PackPatch {
     /// With `--apply`, the path of each file of the patch in the pack's
     /// directory, as the source names the directory.
     pub applied: Vec<String>,
+    /// A warning for each formatter or command of `[compare]` that was
+    /// missing, failed, or ran past its limit, which the command prints on
+    /// stderr, outside its JSON.
+    pub warnings: Vec<String>,
 }
 
 /// `pack_patch` returns the patch of the pack `options.name`: the edits that
@@ -62,24 +69,41 @@ pub struct PackPatch {
 pub fn pack_patch(root: &RepoRoot, options: &PackPatchOptions) -> Result<PackPatch> {
     let name = options.name.as_str();
     let (lock, entry) = super::pack_diff::locked_by_name(root, name, "pakf patch")?;
+    let meaning = pack::Meaning::open(root, pack::For::Reports)?;
+    let patched = patch_of(root, options, &lock, &entry, &meaning);
+    meaning.settle(patched, |r, w| r.warnings = w)
+}
+
+/// `patch_of` returns the patch of `pack_patch` of the pack whose record in
+/// the lock `lock` is `entry`, with the comparison `meaning`, without its
+/// warnings, which `pack_patch` adds.
+fn patch_of(
+    root: &RepoRoot,
+    options: &PackPatchOptions,
+    lock: &pack::Lock,
+    entry: &pack::LockedPack,
+    meaning: &pack::Meaning,
+) -> Result<PackPatch> {
+    let name = options.name.as_str();
     let target = options
         .apply
-        .then(|| apply_target(root, name, &entry))
+        .then(|| apply_target(root, name, entry))
         .transpose()?;
     // The paths refuse before any diff runs, so a refusal prints no patch.
     let chosen = if options.paths.is_empty() {
         None
     } else {
-        Some(selection(root, &lock, &entry, options)?)
+        Some(selection(root, meaning, lock, entry, options)?)
     };
     // An editable file's edit is the project's own, so a patch without a
     // path leaves it out.
     // sokf-implements: CLI-9_AC-36
-    let editable = editable_dests(root, &entry);
+    let editable = editable_dests(root, entry);
     let e = edits(
         root,
+        meaning,
         name,
-        &entry,
+        entry,
         options.accepted,
         Purpose::Patch,
         &|dest| match &chosen {
@@ -91,6 +115,7 @@ pub fn pack_patch(root: &RepoRoot, options: &PackPatchOptions) -> Result<PackPat
         patch: e.patch,
         notes: e.notes,
         applied: Vec::new(),
+        warnings: Vec::new(),
     };
     out.notes
         .extend(chosen.iter().flat_map(|c| c.notes.iter().cloned()));
@@ -130,48 +155,6 @@ fn editable_dests(root: &RepoRoot, entry: &pack::LockedPack) -> BTreeSet<String>
         .collect()
 }
 
-/// `apply_target` returns the pack's directory in the working tree of the
-/// source of the pack `name`, whose record is `entry`, and the directory as
-/// the source names it, or refuses a source that isn't a local directory.
-fn apply_target(
-    root: &RepoRoot,
-    name: &str,
-    entry: &pack::LockedPack,
-) -> Result<(PathBuf, String)> {
-    let Some((url, dir)) = local_dir(root, &entry.source, entry.path.as_deref()) else {
-        return Err(Error::Pack(format!(
-            "--apply: the pack {name} comes from {}, which isn't a local directory, so pakf has no working tree to write; `-o <FILE>` writes the patch for the pack's repository",
-            entry.source
-        )));
-    };
-    let mut label = url.trim_end_matches('/').to_string();
-    for segment in pack::segments(entry.path.as_deref().unwrap_or("")) {
-        label.push('/');
-        label.push_str(segment);
-    }
-    Ok((dir?, label))
-}
-
-/// `local_dir` returns the source `source` of a pack, and the pack's
-/// directory `path` in it, where the source is a local directory.
-fn local_dir(
-    root: &RepoRoot,
-    source: &str,
-    path: Option<&str>,
-) -> Option<(String, Result<PathBuf>)> {
-    let pack::Source::Git(url) = pack::Source::parse(source);
-    if !pack::is_local(&url) {
-        return None;
-    }
-    // The source joins the root without `./`, so that a message names the
-    // directory as the disk does.
-    let source: PathBuf = Path::new(&pack::from_root(&url, root.as_path()))
-        .components()
-        .collect();
-    let dir = pack::clone_dir(&source, path.unwrap_or(""));
-    Some((url, dir))
-}
-
 /// A `NewFile` is a file of the project that `pakf patch` adds to the pack.
 struct NewFile {
     /// The file's path in the pack.
@@ -196,6 +179,8 @@ struct Selection {
 /// A `Selector` holds what `selection` reads once.
 struct Selector<'a> {
     root: &'a RepoRoot,
+    /// The comparison of the command.
+    meaning: &'a pack::Meaning,
     options: &'a PackPatchOptions,
     entry: &'a pack::LockedPack,
     /// The destination of each file that the pack owns.
@@ -240,6 +225,7 @@ struct Selector<'a> {
 // sokf-implements: CLI-9_AC-7
 fn selection(
     root: &RepoRoot,
+    meaning: &pack::Meaning,
     lock: &pack::Lock,
     entry: &pack::LockedPack,
     options: &PackPatchOptions,
@@ -299,6 +285,7 @@ fn selection(
     }
     let mut s = Selector {
         root,
+        meaning,
         options,
         entry,
         owned,
@@ -344,6 +331,13 @@ impl Selector<'_> {
             self.owned_file(dest, true);
             return Ok(());
         }
+        // A path below a link out of the repository is read through no
+        // link, so a directory there is walked by no `-r`.
+        // sokf-implements: CLI-1_AC-46
+        if let Some(out) = pack::link_out(self.root, dest, true) {
+            self.refused.push(cant_read(dest.as_str(), &out.why(dest)));
+            return Ok(());
+        }
         if let Some(owner) = self.owners.get(dest.as_str()) {
             self.refused.push(format!(
                 "{dest}: the pack {owner} owns the file, so its patch carries the edit"
@@ -365,7 +359,7 @@ impl Selector<'_> {
             self.refused.push(in_the_way(dest));
             return Ok(());
         }
-        match pack::read_dest(&path) {
+        match pack::read_dest(self.root, dest) {
             pack::Dest::File(bytes) => self.new_file(dest, bytes, false),
             pack::Dest::Absent => self.refused.push(format!("{dest}: no such file")),
             pack::Dest::Unreadable(why) => self.refused.push(cant_read(dest.as_str(), &why)),
@@ -380,16 +374,29 @@ impl Selector<'_> {
     // sokf-implements: CLI-9_AC-18
     // sokf-implements: CLI-9_AC-34
     fn owned_file(&mut self, dest: &RepoPath, named: bool) {
-        if let pack::Dest::Unreadable(why) = pack::read_dest(&dest.to_fs(self.root)) {
+        if let pack::Dest::Unreadable(why) = pack::read_dest(self.root, dest) {
             self.refused.push(cant_read(dest.as_str(), &why));
             return;
         }
-        let held = self
+        let record = self
             .entry
             .files
             .iter()
-            .find(|(_, f)| f.path == dest.as_str())
-            .is_some_and(|(rel, f)| super::pack::holds_accepted(self.root, rel, f));
+            .find(|(_, f)| f.path == dest.as_str());
+        // A named file whose base copy leads out of the repository is
+        // refused, as one that can't be read is.
+        // sokf-implements: CLI-9_AC-38
+        if named
+            && let Some((rel, _)) = record
+            && let base = pack::base_path(&self.options.name, rel)
+            && let Some(out) =
+                pack::link_out(self.root, &base, true).filter(|o| o.leads != pack::Leads::Nowhere)
+        {
+            self.refused.push(cant_read(base.as_str(), &out.why(&base)));
+            return;
+        }
+        let held = record
+            .is_some_and(|(rel, f)| super::pack::holds_accepted(self.root, self.meaning, rel, f));
         if named && held && !self.options.accepted {
             self.out.notes.push(format!(
                 "{dest}: the file holds the edit that the project accepted, so the patch leaves it out; --accepted takes it"
@@ -587,7 +594,7 @@ impl Selector<'_> {
             if ignored_here {
                 continue;
             }
-            match pack::read_dest(&path) {
+            match pack::read_dest(self.root, &child) {
                 pack::Dest::File(bytes) => self.new_file(&child, bytes, true),
                 pack::Dest::Unreadable(why) => self.refused.push(cant_read(child.as_str(), &why)),
                 pack::Dest::Absent => {}
@@ -692,9 +699,7 @@ impl Selector<'_> {
             .chain(self.landed.iter().map(|(r, d)| (r.as_str(), d.as_str())))
             .find(|(_, d)| d.to_lowercase() == lower);
         if let Some((other, _)) = other {
-            let why = format!(
-                "{rel} lands at {dest}, where the pack's {other} lands too, so the pack has no one version of the file"
-            );
+            let why = format!("{rel} lands at {dest}, where the pack's {other} lands too");
             if walked {
                 self.out.notes.push(format!(
                     "{dest}: sync would refuse the file, so the patch leaves it out: {why}"

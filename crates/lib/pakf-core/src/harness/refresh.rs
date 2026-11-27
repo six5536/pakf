@@ -3,13 +3,15 @@
 //! instructions, builds the block, and asks the adapter to follow it, with
 //! the text that `pakf remove --keep instructions` keeps. The adapter
 //! decides every harness and every file, and returns a report and an exit
-//! code, which the command passes on as they stand.
+//! code, which the command passes on as they stand, apart from the warnings
+//! that name the adapter's own forced install, which `words` puts in
+//! pakf's words.
 
 use std::path::Path;
 
 use agent_harness_adapter_core::{BlockOrder, Request, Scope};
 
-use super::block;
+use super::{block, words};
 use crate::{
     Error, RepoRoot, Result,
     pack::{self, Dest, Lock},
@@ -20,18 +22,21 @@ use crate::{
 const NAME: &str = "pakf";
 
 /// `Instructions` is what a command did with pakf's block: the report and
-/// the exit code of agent-harness-adapter, as they stand, or the line of a
-/// copy that holds the block, when the command handed the adapter nothing.
+/// the exit code of agent-harness-adapter, in pakf's words, or the line of
+/// a copy that holds the block, when the command handed the adapter
+/// nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Instructions {
-    /// The report of agent-harness-adapter, as it stands, and empty when
-    /// the command handed the adapter nothing.
+    /// The report of agent-harness-adapter, as it stands apart from the
+    /// warnings that name its forced install, and empty when the command
+    /// handed the adapter nothing.
     pub report: String,
     /// The exit code of agent-harness-adapter: 0 done, 1 a block that the
     /// project edited left as the adapter found it, and 2 a refusal.
     pub exit: u8,
     /// The `kept` line while a copy of a pack's `instructions.md` holds the
-    /// block, which names the copy and says how to free the block.
+    /// block, which names the copy, says how to free it, and that the next
+    /// sync then updates the block.
     pub held: Option<String>,
 }
 
@@ -82,27 +87,29 @@ impl Copies {
     }
 }
 
-/// `read_copy` reads the copy of the `instructions.md` of the pack `name`
-/// into `out`: nothing when it is absent, its text, and whether it holds a
-/// conflict or isn't readable, as a regular file of UTF-8 text.
-fn read_copy(root: &RepoRoot, name: &str, out: &mut Copies) {
+/// `read_copy` reads the copy of the `instructions.md` of the pack `name`,
+/// whose record in the lock is `record`, into `out`: nothing when it is
+/// absent, its text, and whether it holds a conflict, as
+/// `LockedFile::holds_conflict` reads one, or isn't readable, as a regular
+/// file of UTF-8 text.
+fn read_copy(root: &RepoRoot, name: &str, record: &pack::LockedFile, out: &mut Copies) {
     let path = pack::instructions_of(name);
     let shown = path.as_str().to_string();
-    match pack::read_dest(&path.to_fs(root)) {
+    let conflicted = |bytes: &[u8]| record.holds_conflict(root, name, INSTRUCTIONS, bytes);
+    match pack::read_dest(root, &path) {
         Dest::Absent => {}
         Dest::File(bytes) => match String::from_utf8(bytes) {
             Ok(text) => {
-                if !crate::conflicts::conflict_lines(&path, &text).is_empty() {
+                if conflicted(text.as_bytes()) {
                     out.conflicted.push(shown);
                 }
                 out.texts.push((name.to_string(), text));
             }
             Err(e) => {
-                let lossy = String::from_utf8_lossy(e.as_bytes());
-                if crate::conflicts::conflict_lines(&path, &lossy).is_empty() {
-                    out.unreadable.push((shown, "its text isn't UTF-8".into()));
-                } else {
+                if conflicted(e.as_bytes()) {
                     out.conflicted.push(shown);
+                } else {
+                    out.unreadable.push((shown, "its text isn't UTF-8".into()));
                 }
             }
         },
@@ -110,21 +117,24 @@ fn read_copy(root: &RepoRoot, name: &str, out: &mut Copies) {
     }
 }
 
-/// `records_instructions` returns whether the lock records the pack's
-/// `instructions.md`, so that a copy that a pack no longer holds, or a
-/// file that no pack placed, gives the block no text.
-fn records_instructions(locked: &pack::LockedPack) -> bool {
-    locked.files.contains_key("instructions.md")
-}
+/// `INSTRUCTIONS` is the path of a pack's instructions in the pack, by which
+/// the lock records the copy.
+const INSTRUCTIONS: &str = "instructions.md";
 
 /// `read_copies` reads the copy of the `instructions.md` of each pack of
-/// `lock` that records one, in the order of the packs.
+/// `lock` that records one, in the order of the packs, so that a copy that
+/// a pack no longer holds, or a file that no pack placed, gives the block
+/// no text.
 // sokf-implements: INST-1_AC-2
 pub(crate) fn read_copies(root: &RepoRoot, lock: &Lock) -> Copies {
     let mut out = Copies::default();
     for name in pack::ordered(root, lock) {
-        if lock.packs.get(&name).is_some_and(records_instructions) {
-            read_copy(root, &name, &mut out);
+        if let Some(record) = lock
+            .packs
+            .get(&name)
+            .and_then(|p| p.files.get(INSTRUCTIONS))
+        {
+            read_copy(root, &name, record, &mut out);
         }
     }
     out
@@ -152,9 +162,10 @@ fn request(root: &Path, block: Option<String>, keep: Option<&str>) -> Request {
 
 /// `refresh` hands pakf's block of the packs of `lock`, which the command
 /// has written, to agent-harness-adapter, with the text to keep `keep`, and
-/// returns the report and the exit code that the adapter gives. While a
-/// copy of a pack's instructions holds a conflict or isn't readable, it
-/// hands the adapter nothing, and returns the line that names the copy.
+/// returns the report that the adapter gives, in pakf's words, and its exit
+/// code. While a copy of a pack's instructions holds a conflict or isn't
+/// readable, it hands the adapter nothing, and returns the line that names
+/// the copy.
 // sokf-implements: INST-1_AC-6
 // sokf-implements: INST-1_AC-7
 pub(crate) fn refresh(root: &RepoRoot, lock: &Lock, keep: Option<&str>) -> Instructions {
@@ -162,7 +173,7 @@ pub(crate) fn refresh(root: &RepoRoot, lock: &Lock, keep: Option<&str>) -> Instr
     if copies.held() {
         return Instructions {
             held: Some(format!(
-                "kept pakf's block as it stands: {}; {}, and the next `pakf sync` hands the block to agent-harness-adapter",
+                "kept pakf's block as it stands: {}; {}, and the next `pakf sync` updates the block",
                 copies.why(),
                 copies.fix()
             )),
@@ -175,7 +186,7 @@ pub(crate) fn refresh(root: &RepoRoot, lock: &Lock, keep: Option<&str>) -> Instr
         keep,
     ));
     Instructions {
-        report: out.report,
+        report: words::reword(&out.report),
         exit: out.exit,
         held: None,
     }

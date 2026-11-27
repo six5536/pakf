@@ -1,6 +1,6 @@
 [package]
 name = "pakf"
-description = "pakf shares project files through packs."
+description = "pakf shares project files through packs. Unstable: its commands, options and file formats can change in any release."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,7 @@ name = "pakf"
 path = "src/main.rs"
 
 [dependencies]
-agent-harness-adapter-core = "0.4.0"
+agent-harness-adapter-core = "0.5.0"
 clap = { version = "4.6", features = ["derive"] }
 pakf-core = { workspace = true }
 serde = { version = "1", features = ["derive"] }
